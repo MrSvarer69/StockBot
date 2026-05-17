@@ -1,0 +1,24 @@
+opening_range_minutes: 30
+session_start_et: "09:30"
+session_end_et: "16:00"
+flat_by_et: "15:55"
+# Suppress new entries at or after this time (ET) — the bound is exclusive,
+# so a bar timestamped exactly 12:00:00 is rejected. ORB historically does
+# poorly on late-day breakouts; the opening-range follow-through is
+# concentrated in the first ~2 hours. Flat signals are NOT subject to this;
+# positions can still close after the cutoff.
+latest_entry_et: "12:00"
+# Number of prior regular-session high-low ranges averaged into the session-scale
+# ATR used by both the OR-range filter and the stop multiplier.
+atr_period_sessions: 14
+atr_stop_multiplier: 1.5
+take_r_multiple: 2.0
+target_size_pct: 0.10
+# Reject sessions where the 30-min OR is less than this fraction of the rolling
+# session-ATR. Sized against the session-scale ATR (rolling mean of prior
+# session high-low ranges), not a per-minute true range. Sanity check on
+# NVDA/AMD/PLTR/SNOW (May 2026 sample) showed the OR/session-ATR ratio sits in
+# roughly [0.37, 1.43] with median ~0.75, so 0.5 trims the bottom decile or so
+# of low-conviction days without nuking the universe.
+min_range_atr_multiplier: 0.5
+allow_short: true

@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+from decimal import Decimal
+
+from trading_bot.risk import (
+    AccountState,
+    OrderSide,
+    OrderType,
+    Position,
+    ProposedOrder,
+    RiskParams,
+    validate_order,
+)
+
+
+def _state(**overrides) -> AccountState:
+    base = dict(equity=Decimal("100000"), cash=Decimal("100000"))
+    base.update(overrides)
+    return AccountState(**base)
+
+
+def _params(**overrides) -> RiskParams:
+    return RiskParams(**overrides)
+
+
+def _order(**overrides) -> ProposedOrder:
+    base = dict(
+        symbol="SPY",
+        side=OrderSide.BUY,
+        qty=Decimal("10"),
+        order_type=OrderType.MARKET,
+    )
+    base.update(overrides)
+    return ProposedOrder(**base)
+
+
+def test_happy_path_approved(tmp_path):
+    params = _params(kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(_order(), _state(), params, market_is_open=True)
+    assert decision.approved
+    assert decision.order is not None
+
+
+def test_connection_down_rejected(tmp_path):
+    params = _params(kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(
+        _order(), _state(connection_ok=False), params, market_is_open=True
+    )
+    assert not decision.approved
+    assert "connection" in decision.reason
+
+
+def test_zero_qty_rejected(tmp_path):
+    params = _params(kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(
+        _order(qty=Decimal("0")), _state(), params, market_is_open=True
+    )
+    assert not decision.approved
+    assert "qty" in decision.reason
+
+
+def test_negative_limit_price_rejected(tmp_path):
+    params = _params(kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(
+        _order(limit_price=Decimal("-1")), _state(), params, market_is_open=True
+    )
+    assert not decision.approved
+    assert "limit_price" in decision.reason
+
+
+def test_whitelist_blocks_unlisted_symbol(tmp_path):
+    params = _params(
+        symbol_whitelist=frozenset({"AAPL", "MSFT"}),
+        kill_file_path=str(tmp_path / "KILL"),
+    )
+    decision = validate_order(_order(symbol="SPY"), _state(), params, market_is_open=True)
+    assert not decision.approved
+    assert "whitelist" in decision.reason
+
+
+def test_empty_whitelist_allows_any(tmp_path):
+    params = _params(kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(_order(symbol="TSLA"), _state(), params, market_is_open=True)
+    assert decision.approved
+
+
+def test_open_order_cap_rejected(tmp_path):
+    params = _params(max_open_orders=2, kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(
+        _order(), _state(open_order_count=2), params, market_is_open=True
+    )
+    assert not decision.approved
+    assert "open orders" in decision.reason
+
+
+def test_position_count_cap_rejected(tmp_path):
+    params = _params(max_position_count=2, kill_file_path=str(tmp_path / "KILL"))
+    positions = {
+        "AAPL": Position("AAPL", Decimal("1"), Decimal("100")),
+        "MSFT": Position("MSFT", Decimal("1"), Decimal("100")),
+    }
+    decision = validate_order(
+        _order(symbol="TSLA"),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+    )
+    assert not decision.approved
+    assert "position count" in decision.reason
+
+
+def test_adding_to_existing_position_allowed_even_at_cap(tmp_path):
+    params = _params(max_position_count=2, kill_file_path=str(tmp_path / "KILL"))
+    positions = {
+        "SPY": Position("SPY", Decimal("1"), Decimal("100")),
+        "AAPL": Position("AAPL", Decimal("1"), Decimal("100")),
+    }
+    decision = validate_order(
+        _order(symbol="SPY"),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+    )
+    assert decision.approved
+
+
+def test_market_closed_rejected(tmp_path):
+    params = _params(kill_file_path=str(tmp_path / "KILL"))
+    decision = validate_order(_order(), _state(), params, market_is_open=False)
+    assert not decision.approved
+    assert "market closed" in decision.reason
+
+
+def test_daily_loss_kill_switch_rejected(tmp_path):
+    params = _params(
+        max_daily_loss_pct=Decimal("0.03"),
+        kill_file_path=str(tmp_path / "KILL"),
+    )
+    state = _state(realized_pnl_today=Decimal("-5000"))  # > 3% of 100k
+    decision = validate_order(_order(), state, params, market_is_open=True)
+    assert not decision.approved
+    assert "daily loss" in decision.reason
+
+
+def test_kill_file_rejected(tmp_path):
+    kill_path = tmp_path / "KILL"
+    kill_path.write_text("halt")
+    params = _params(kill_file_path=str(kill_path))
+    decision = validate_order(_order(), _state(), params, market_is_open=True)
+    assert not decision.approved
+    assert "kill file" in decision.reason
+
+
+def test_kill_env_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_KILL", "1")
+    params = _params(kill_file_path=str(tmp_path / "absent"))
+    decision = validate_order(_order(), _state(), params, market_is_open=True)
+    assert not decision.approved
+    assert "TRADING_KILL" in decision.reason
+
+
+def test_daily_notional_cap_blocks_oversize(tmp_path):
+    params = _params(
+        max_daily_notional_pct=Decimal("0.10"),
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    state = _state(cumulative_notional_today=Decimal("9500"))
+    # equity 100k * 0.10 cap = 10000. Already used 9500. Order: 10 shares * $100 = $1000 → 10500 > 10000.
+    decision = validate_order(
+        _order(qty=Decimal("10")),
+        state,
+        params,
+        market_is_open=True,
+        current_price=Decimal("100"),
+    )
+    assert not decision.approved
+    assert "daily notional cap" in decision.reason
+
+
+def test_daily_notional_cap_allows_under_limit(tmp_path):
+    params = _params(
+        max_daily_notional_pct=Decimal("0.10"),
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    state = _state(cumulative_notional_today=Decimal("5000"))
+    decision = validate_order(
+        _order(qty=Decimal("10")),
+        state,
+        params,
+        market_is_open=True,
+        current_price=Decimal("100"),
+    )
+    assert decision.approved
+
+
+def test_daily_notional_cap_skipped_without_price(tmp_path, caplog):
+    """No current_price + no limit_price means we cannot enforce — log + allow."""
+    params = _params(kill_file_path=str(tmp_path / "absent"))
+    state = _state(cumulative_notional_today=Decimal("99999999"))
+    decision = validate_order(_order(), state, params, market_is_open=True)
+    # Approved because we cannot compute notional without a price.
+    assert decision.approved
+
+
+def test_daily_notional_uses_limit_price_when_market_price_absent(tmp_path):
+    params = _params(
+        max_daily_notional_pct=Decimal("0.10"),
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    state = _state(cumulative_notional_today=Decimal("9500"))
+    decision = validate_order(
+        _order(qty=Decimal("10"), limit_price=Decimal("100")),
+        state,
+        params,
+        market_is_open=True,
+    )
+    assert not decision.approved
+    assert "daily notional cap" in decision.reason
