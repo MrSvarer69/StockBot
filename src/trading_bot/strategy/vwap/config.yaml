@@ -1,0 +1,89 @@
+# VWAP reclaim / rejection — intraday mean-reversion strategy (v2).
+#
+# Mechanism: VWAP is the institutional intraday benchmark. Price extending
+# away from VWAP and then closing back across it indicates a failed extension:
+# chasers are now offside, and a reversion toward (and through) VWAP becomes
+# the path of least resistance. The v2 design layers two structural changes
+# on top of the v1 reclaim/rejection trigger:
+#
+#   (a) asymmetric stop/take so the math is positive-expectancy at typical
+#       fill rates, rather than break-even by construction;
+#   (b) a daily-trend regime filter so reclaims only fire with the dominant
+#       trend (the canonical mean-reversion failure mode is fading a strong
+#       trend);
+#   (c) a composite score (extension-depth * volume-exhaustion) that has a
+#       mechanical reason to correlate with reclaim quality.
+
+session_start_et: "09:30"
+session_end_et: "16:00"
+flat_by_et: "15:55"
+
+# Latest ET time at which a NEW entry may open. Later than ORB's noon cutoff
+# because VWAP is meant to fire through the afternoon; earlier than flat_by_et
+# to leave room for the take to fill before forced flatten.
+latest_entry_et: "15:00"
+
+# Number of consecutive closes on the reclaim side required to confirm. 2 is
+# the minimum that filters single-bar wicks; raising to 3 cuts noise at the
+# cost of later (and worse-priced) entries.
+confirm_bars: 2
+
+# Number of preceding bars the price must have been on the OTHER side of VWAP
+# before the reclaim can fire. Without an extension precondition the strategy
+# would fire on every micro-cross around VWAP. 5 bars at 1-min ~ 5 minutes of
+# one-sided trade.
+min_extension_bars: 5
+
+# Bar-scale ATR period in BARS, not sessions. 14 is the textbook ATR default
+# (Wilder, "New Concepts in Technical Trading Systems", 1978).
+atr_period_bars: 14
+
+# Stop = entry_close +/- atr_stop_multiplier * atr_bar.
+# 1.0 ATR is one normal-bar of adverse motion: the noise floor for a 1-min
+# bar. The mean-reversion thesis ("extension is exhausted, reversion is now
+# the path of least resistance") dies fast if wrong; a wide stop just lets
+# losers run. Tighter than ORB (1.5) because trend-following needs to ride
+# noise that mean-reversion does not.
+atr_stop_multiplier: 1.0
+
+# Take = R-multiple of stop distance. 1.5R reward on 1R risk gives the
+# asymmetric edge required for a sub-50% win-rate signal to break even before
+# slippage (break-even win-rate = R_loss / (R_loss + R_win) = 1 / 2.5 = 40%).
+# The number itself is from the asymmetric-Kelly literature on
+# mean-reversion (Tharp, "Trade Your Way to Financial Freedom", ch. 5):
+# 1.5R is the smallest take that comfortably tolerates a ~40% win rate.
+take_r_multiple: 1.5
+
+# --- Trend regime filter (new in v2) ----------------------------------------
+#
+# Mean reversion against a dominant trend is the canonical failure mode of
+# VWAP fades (Almgren, "Optimal Execution of Portfolio Transactions"). When
+# institutions are systematically buying, dips below VWAP get bid back —
+# *long* reclaims work *with* the regime. When they are systematically
+# selling, pops above VWAP get sold — *short* rejections work with the
+# regime. Fading the dominant trend requires different evidence (exhaustion,
+# divergence) that this design does not measure, so we suppress those signals.
+
+# Number of PRIOR sessions used to compute the trend SMA. 20 sessions is the
+# textbook short-trend window (Wilder).
+trend_filter_period_sessions: 20
+
+# If true, signals against the daily trend are allowed (legacy v1 behavior).
+# Default false: long reclaim requires daily uptrend, short rejection
+# requires daily downtrend.
+allow_against_trend: false
+
+# Per-trade notional share. Matches ORB so the two strategies behave
+# symmetrically under the shared risk cap.
+target_size_pct: 0.10
+
+# Cooldown after the most recent same-symbol entry, in minutes. Prevents
+# thrashing when price oscillates around VWAP. 30 min ~ enough for the prior
+# trade's stop/take to resolve in normal conditions.
+cooldown_minutes: 30
+
+# Symmetric by default: rejection-from-above produces a short, gated by the
+# trend filter above. Set false to run long-only (useful during persistent
+# bull-tape regimes where you do not want short signals at all, independent
+# of the per-session trend check).
+allow_short: true

@@ -1,0 +1,87 @@
+# Rolling Range Breakout (RRB) — intraday momentum continuation.
+#
+# Mechanism: Donchian-style breakout adapted to the intraday timeframe.
+# Every bar, compute the rolling-window high and low over the prior N
+# minutes. A close strictly above the rolling high fires a long; a close
+# strictly below the rolling low fires a short. Sized off bar-scale ATR.
+#
+# This is the same family of trigger that drove ORB's positive PF on this
+# universe (SPY 0.93, NVDA 1.45, AAPL 1.13, JPM 1.23 over 2025-11-15 ->
+# 2026-05-13). What ORB does once at 09:30 + opening_range_minutes, RRB
+# does continuously: signals fire across the full session, addressing the
+# late-launch problem documented in HANDOVER.md without abandoning the
+# only trigger mechanic that has been empirically validated on this tape.
+#
+# This is NOT a parameter sweep over VWAP. The VWAP mean-reversion concept
+# is structurally different (counter-trend) and posted negative PF across
+# 1200+ trades on the same universe. RRB is a structural pivot back to the
+# momentum side of the trigger space.
+
+session_start_et: "09:30"
+session_end_et: "16:00"
+flat_by_et: "15:55"
+
+# Latest ET time at which a new entry may open. Late-session breakouts
+# trail into the closing auction and have less room to run before the
+# 15:55 forced flatten. 15:00 leaves ~55 minutes for the take to fill;
+# matches the VWAP config so the two strategies have symmetric late-day
+# behavior.
+latest_entry_et: "15:00"
+
+# Length of the rolling reference window in minutes. The window must be
+# long enough that "above the window high" is a meaningful level (not
+# just last bar's noise), short enough that the window has refreshed
+# since the last regime change. 60 min is the canonical intraday-breakout
+# horizon in Donchian-derived literature (Donchian channels were
+# originally 20-day on dailies; 60-min on 1-min bars is the textbook
+# intraday analog — see Kaufman, "Trading Systems and Methods" ch. 14).
+# Picking 60 from theory; the backtester will validate.
+lookback_minutes: 60
+
+# Warm-up: do not generate signals until the rolling window is full. The
+# first lookback_minutes of each session have an incomplete reference
+# level and would surface false breakouts that are really just "first bar
+# above the partial window's high".
+require_full_window: true
+
+# Bar-scale ATR period (BARS, not sessions). 14 is the textbook ATR
+# default (Wilder, "New Concepts in Technical Trading Systems", 1978).
+atr_period_bars: 14
+
+# Stop = entry_close +/- atr_stop_multiplier * atr_bar.
+# 1.0 ATR is one normal-bar of adverse motion — the natural noise floor
+# for a 1-min bar. Tighter than ORB's 1.5 because the rolling-breakout
+# signal trades more frequently and per-trade conviction is lower; we
+# rely on the take-multiple, not the stop-distance, to do the work.
+atr_stop_multiplier: 1.0
+
+# Take = take_r_multiple * (entry - stop) distance.
+# 2.0R is the standard trend-follow R-multiple (Tharp, "Trade Your Way
+# to Financial Freedom", ch. 5). Break-even win rate at 2.0R is
+# 1 / (1 + 2.0) = 33.3%. ORB's same universe printed 47-62% win rates
+# at the 2.0R take; RRB on lower-quality intraday breakouts should
+# still clear 33.3% with margin. Matches ORB's default deliberately so
+# the two strategies are comparable.
+take_r_multiple: 2.0
+
+# Minimum breakout strength to fire: (close - rolling_high) / atr_bar
+# for longs (mirrored for shorts). 0.25 is the structural floor — a
+# close less than a quarter-ATR through the level is in the noise band
+# and not a confirmed break. Not from a backtest sweep; this is a
+# sanity threshold below which the trigger is mechanically meaningless.
+min_breakout_strength: 0.25
+
+# Per-trade notional share. Matches ORB and VWAP so the three strategies
+# behave symmetrically under the shared risk cap.
+target_size_pct: 0.10
+
+# Cooldown after the most recent same-symbol entry, in minutes. Without
+# a cooldown, a series of strongly-trending bars would fire a long every
+# bar as long as each new close kept making a new rolling high. 30 min
+# is enough for the prior trade's stop/take to typically resolve.
+# Matches VWAP.
+cooldown_minutes: 30
+
+# Symmetric by default: a downside break fires a short. Set false to
+# run long-only.
+allow_short: true

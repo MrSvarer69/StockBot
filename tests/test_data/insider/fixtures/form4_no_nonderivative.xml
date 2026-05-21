@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ownershipDocument>
+  <schemaVersion>X0306</schemaVersion>
+  <documentType>4</documentType>
+  <periodOfReport>2026-02-10</periodOfReport>
+  <issuer>
+    <issuerCik>0000555555</issuerCik>
+    <issuerName>DERIVATIVE ONLY CO</issuerName>
+    <issuerTradingSymbol>DRVO</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId>
+      <rptOwnerCik>0007777777</rptOwnerCik>
+      <rptOwnerName>HOLDER NAME</rptOwnerName>
+    </reportingOwnerId>
+    <reportingOwnerRelationship>
+      <isDirector>1</isDirector>
+      <isOfficer>0</isOfficer>
+      <isTenPercentOwner>0</isTenPercentOwner>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+</ownershipDocument>

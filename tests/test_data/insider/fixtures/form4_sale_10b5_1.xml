@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ownershipDocument>
+  <schemaVersion>X0306</schemaVersion>
+  <documentType>4</documentType>
+  <periodOfReport>2026-04-01</periodOfReport>
+  <issuer>
+    <issuerCik>0000789012</issuerCik>
+    <issuerName>ANOTHER FIXTURE CORP</issuerName>
+    <issuerTradingSymbol>anfx</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId>
+      <rptOwnerCik>0009876543</rptOwnerCik>
+      <rptOwnerName>DOE JANE</rptOwnerName>
+    </reportingOwnerId>
+    <reportingOwnerRelationship>
+      <isDirector>0</isDirector>
+      <isOfficer>1</isOfficer>
+      <isTenPercentOwner>0</isTenPercentOwner>
+      <officerTitle>Chief Financial Officer</officerTitle>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle>
+        <value>Common Stock</value>
+      </securityTitle>
+      <transactionDate>
+        <value>2026-03-30</value>
+      </transactionDate>
+      <transactionCoding>
+        <transactionFormType>4</transactionFormType>
+        <transactionCode>S</transactionCode>
+        <equitySwapInvolved>0</equitySwapInvolved>
+      </transactionCoding>
+      <transactionAmounts>
+        <transactionShares>
+          <value>2000</value>
+        </transactionShares>
+        <transactionPricePerShare>
+          <value>55.7800</value>
+        </transactionPricePerShare>
+        <transactionAcquiredDisposedCode>
+          <value>D</value>
+        </transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction>
+          <value>48000</value>
+        </sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>
+    </nonDerivativeTransaction>
+    <nonDerivativeTransaction>
+      <securityTitle>
+        <value>Common Stock</value>
+      </securityTitle>
+      <transactionDate>
+        <value>2026-03-30</value>
+      </transactionDate>
+      <transactionCoding>
+        <transactionFormType>4</transactionFormType>
+        <transactionCode>S</transactionCode>
+        <equitySwapInvolved>0</equitySwapInvolved>
+      </transactionCoding>
+      <transactionAmounts>
+        <transactionShares>
+          <value>500</value>
+        </transactionShares>
+        <transactionPricePerShare>
+          <value>55.8200</value>
+        </transactionPricePerShare>
+        <transactionAcquiredDisposedCode>
+          <value>D</value>
+        </transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction>
+          <value>47500</value>
+        </sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+  <footnotes>
+    <footnote id="F1">These sales were effected pursuant to a Rule 10b5-1 trading plan adopted in 2025.</footnote>
+  </footnotes>
+</ownershipDocument>
