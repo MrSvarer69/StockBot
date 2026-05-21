@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -93,7 +93,17 @@ class SessionConfig:
     poll_interval_seconds: int = 60
     lookback_minutes: int = 60 * 24 * 3  # 3 calendar days back
     max_iterations: int | None = None  # cap for tests; None = unlimited
-    flatten_on_exit: bool = True
+    # Flatten positions on a CLEAN exit (manual Ctrl-C / SIGTERM, market close,
+    # max_iterations reached). Default False: ORB emits its own flat signals
+    # before close, and a manual stop is usually an operator intervention
+    # rather than a "close everything" instruction. Positions roll across bot
+    # restarts; the broker-side bracket children keep guarding them.
+    flatten_on_exit: bool = False
+    # Flatten on a HALT exit (kill-switch trip, broker auth/validation error,
+    # consecutive broker failures). Default True: a halt means something is
+    # wrong; closing positions while the broker is still reachable is the safe
+    # reflex. Override only with deliberate operator opt-out.
+    flatten_on_halt: bool = True
     max_consecutive_failures: int = 5
     # Override to redirect session_start_equity persistence (e.g. in tests).
     session_state_dir: Path | None = None
@@ -127,6 +137,37 @@ class SessionConfig:
     picker_min_ratio: float | None = None
     # Optional run id; if None, run_session generates one in UTC ISO-basic form.
     run_id: str | None = None
+    # Optional in-session strategy-data refresh. ``refresh_hook`` is a
+    # no-argument callable invoked every ``refresh_interval_minutes`` of
+    # wall-clock time, used today by the insider strategy to pull new Form 4
+    # filings from EDGAR and rebuild its in-memory signal index. The hook
+    # runs synchronously in the session's main loop (no thread), so it
+    # MUST return well inside ``poll_interval_seconds`` — a hook that
+    # blocks longer than the poll interval delays the next stop/take check
+    # and bar fetch by exactly that amount. Recommended upper bound:
+    # ~30s for the 60s default poll. Any exception raised by the hook is
+    # caught, logged, and does not halt the session; ``last_refresh_at`` is
+    # still advanced so a failing hook does not spin-retry every iteration.
+    refresh_interval_minutes: int | None = None
+    refresh_hook: Callable[[], None] | None = None
+
+    def __post_init__(self) -> None:
+        # Fail fast on a misconfigured hook. Without this, a non-callable
+        # would only blow up inside the loop's try/except where it would be
+        # logged as "refresh_hook failed" every interval forever.
+        if self.refresh_hook is not None and not callable(self.refresh_hook):
+            raise TypeError(
+                "SessionConfig.refresh_hook must be callable or None, "
+                f"got {type(self.refresh_hook).__name__}"
+            )
+        if (
+            self.refresh_interval_minutes is not None
+            and self.refresh_interval_minutes <= 0
+        ):
+            raise ValueError(
+                "SessionConfig.refresh_interval_minutes must be a positive "
+                f"int or None (got {self.refresh_interval_minutes})"
+            )
 
 
 @dataclass(frozen=True)
@@ -173,6 +214,9 @@ class SessionState:
     # corresponding exit (flat signal or _flatten_all close) pairs and pops.
     trades: list = field(default_factory=list)
     open_entries: dict = field(default_factory=dict)
+    # Wall-clock timestamp of the last successful refresh_hook invocation.
+    # None until the first refresh fires (or always, if refresh is disabled).
+    last_refresh_at: datetime | None = None
 
 
 def _install_signal_handlers(state: SessionState) -> None:
@@ -709,6 +753,86 @@ def _handle_entry_signal(
     return resp
 
 
+def _check_stops_and_takes(
+    *,
+    broker: BrokerClient,
+    sess: SessionState,
+    sleep_fn=time.sleep,
+) -> None:
+    """For every tracked open entry, close the position if the latest trade
+    price has breached its stored stop or take level.
+
+    Runs once per poll iteration as defense-in-depth alongside the broker-side
+    bracket children attached at submit time. This bot-side check is the
+    primary path while the session is running — it produces a clean Trade
+    record with exit_reason="stop"/"take". Brackets are the safety net for
+    when the bot is offline; if a bracket fires while we're down, the
+    `open_entries` row is dropped at session end without a Trade.
+
+    Stop wins over take when both are simultaneously breached (e.g. a wide
+    intrabar move): preserving capital takes priority over locking in a gain.
+    """
+    for symbol, entry in list(sess.open_entries.items()):
+        stop = entry.get("stop_price")
+        take = entry.get("take_price")
+        if stop is None and take is None:
+            continue
+        try:
+            price = broker.get_latest_trade_price(symbol)
+        except (BrokerAuthError, BrokerValidationError):
+            raise
+        except BrokerError:
+            logger.exception(
+                "stop/take check: get_latest_trade_price failed",
+                extra={"symbol": symbol},
+            )
+            continue
+        side = entry["side"]
+        triggered: str | None = None
+        if side == "long":
+            if stop is not None and price <= stop:
+                triggered = "stop"
+            elif take is not None and price >= take:
+                triggered = "take"
+        else:
+            if stop is not None and price >= stop:
+                triggered = "stop"
+            elif take is not None and price <= take:
+                triggered = "take"
+        if triggered is None:
+            continue
+        logger.info(
+            "stop/take triggered",
+            extra={
+                "symbol": symbol,
+                "reason": triggered,
+                "price": str(price),
+                "side": side,
+                "stop_price": str(stop) if stop is not None else None,
+                "take_price": str(take) if take is not None else None,
+            },
+        )
+        try:
+            canceled = broker.cancel_orders_for(symbol)
+        except (BrokerAuthError, BrokerValidationError):
+            raise
+        except BrokerError:
+            logger.exception(
+                "cancel_orders_for failed; proceeding with close",
+                extra={"symbol": symbol},
+            )
+            canceled = 0
+        if canceled:
+            logger.info(
+                "canceled pending order(s) before stop/take close",
+                extra={"symbol": symbol, "canceled": canceled},
+            )
+        resp = broker.close_position(symbol)
+        if resp is not None:
+            resp = _await_fill(broker, resp, sleep_fn=sleep_fn)
+        _record_exit(sess, symbol, resp, exit_reason=triggered)
+
+
 #Rename if new strategy is implemented, it will cause conflict
 def _handle_flat_signal(
     *,
@@ -1020,6 +1144,33 @@ def run_session(
                 logger.info("market closed, stopping")
                 break
 
+            # Periodic strategy-data refresh (e.g. pull new Form 4 filings
+            # from EDGAR and rebuild the insider signal index). Runs in this
+            # thread so it must return promptly; any exception is logged and
+            # absorbed so a transient EDGAR hiccup never halts trading. The
+            # refresh's data flows only into strategy.generate_signals on
+            # subsequent iterations — it never touches the order, risk, or
+            # position-tracking paths in this loop.
+            if (
+                config.refresh_interval_minutes is not None
+                and config.refresh_hook is not None
+            ):
+                _now = now_fn()
+                _last = sess.last_refresh_at
+                _due = _last is None or (
+                    (_now - _last).total_seconds()
+                    >= config.refresh_interval_minutes * 60
+                )
+                if _due:
+                    try:
+                        config.refresh_hook()  # type: ignore[operator]
+                        sess.last_refresh_at = _now
+                    except Exception:
+                        # Never let a refresh failure halt the session; the
+                        # previous signal set remains in effect.
+                        logger.exception("strategy refresh_hook failed")
+                        sess.last_refresh_at = _now
+
             account = broker.get_account()
             if sess.session_start_equity is None:
                 # First poll of a fresh session: seed baseline + persist.
@@ -1053,6 +1204,16 @@ def run_session(
                         state_path, sess.session_start_equity
                     )
             sess.realized_pnl_today = account.equity - sess.session_start_equity
+
+            # Defense-in-depth: close any position whose price has breached its
+            # stored stop/take level before processing new signals. Runs before
+            # bars are fetched so a stop-out frees its slot in the position cap
+            # in time for this iteration's entry candidates.
+            _check_stops_and_takes(
+                broker=broker,
+                sess=sess,
+                sleep_fn=sleep_fn,
+            )
 
             bars_by_symbol = _fetch_bars_for_symbols(
                 broker,
@@ -1175,7 +1336,17 @@ def run_session(
             logger.warning("safety check tripped during sleep: %s", sleep_reason)
             break
 
-    if config.flatten_on_exit:
+    # Two-track flatten gate. halt_reason is set ONLY for fault-class exits
+    # (kill switch trip, broker auth/validation error, consecutive failures);
+    # market-close and SIGINT exits leave it None. The two paths consult
+    # different config knobs so the operator can opt into closing positions
+    # on clean exit without weakening the safety reflex on halt.
+    should_flatten = (
+        config.flatten_on_halt
+        if sess.halt_reason is not None
+        else config.flatten_on_exit
+    )
+    if should_flatten:
         sess.flatten_result = _flatten_all(broker, sess, sleep_fn=sleep_fn)
         if sess.flatten_result.positions_failed:
             # run_id is seeded unconditionally at session start (see SessionState

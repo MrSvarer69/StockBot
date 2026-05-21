@@ -204,22 +204,55 @@ class AlpacaPaperBroker:
         return Decimal(str(trade.price))
 
     def submit_order(self, order: ProposedOrder) -> BrokerOrderResponse:
+        from alpaca.trading.enums import OrderClass
         from alpaca.trading.enums import OrderSide as AlpacaSide
         from alpaca.trading.enums import TimeInForce
         from alpaca.trading.requests import (
             LimitOrderRequest,
             MarketOrderRequest,
+            StopLossRequest,
+            TakeProfitRequest,
         )
 
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
+        has_stop = order.stop_price is not None
+        has_take = order.take_price is not None
+        bracket_kind: str | None = None
         if order.order_type == OrderType.MARKET:
-            req = MarketOrderRequest(
+            kwargs: dict = dict(
                 symbol=order.symbol,
                 qty=float(order.qty),
                 side=side,
                 time_in_force=TimeInForce.DAY,
                 client_order_id=order.client_order_id,
             )
+            # Broker-side safety net: attach stop/take as bracket children so the
+            # position closes even if the bot crashes or loses connectivity.
+            # The poll-side stop/take check in session.py is the primary trigger
+            # — brackets are the fallback. cancel_orders_for() in the close
+            # path cancels these children when the bot triggers first.
+            if has_stop and has_take:
+                kwargs["order_class"] = OrderClass.BRACKET
+                kwargs["stop_loss"] = StopLossRequest(
+                    stop_price=float(order.stop_price)
+                )
+                kwargs["take_profit"] = TakeProfitRequest(
+                    limit_price=float(order.take_price)
+                )
+                bracket_kind = "bracket"
+            elif has_stop:
+                kwargs["order_class"] = OrderClass.OTO
+                kwargs["stop_loss"] = StopLossRequest(
+                    stop_price=float(order.stop_price)
+                )
+                bracket_kind = "oto_stop"
+            elif has_take:
+                kwargs["order_class"] = OrderClass.OTO
+                kwargs["take_profit"] = TakeProfitRequest(
+                    limit_price=float(order.take_price)
+                )
+                bracket_kind = "oto_take"
+            req = MarketOrderRequest(**kwargs)
         elif order.order_type == OrderType.LIMIT:
             if order.limit_price is None:
                 raise BrokerError("limit order missing limit_price")
@@ -242,6 +275,9 @@ class AlpacaPaperBroker:
                 "qty": str(order.qty),
                 "type": order.order_type.value,
                 "client_order_id": order.client_order_id,
+                "order_class": bracket_kind,
+                "stop_price": str(order.stop_price) if has_stop else None,
+                "take_price": str(order.take_price) if has_take else None,
             },
         )
         try:

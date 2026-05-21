@@ -266,6 +266,7 @@ class ORBStrategy:
                 "target_size_pct",
                 "stop_price",
                 "take_price",
+                "score",
                 "or_atr_ratio",
             ]
         ]
@@ -309,6 +310,10 @@ class ORBStrategy:
             "target_size_pct": float(self.config.target_size_pct),
             "stop_price": stop,
             "take_price": take,
+            # Unified cross-strategy conviction column. ORB's score is the
+            # OR/session-ATR ratio; both columns carry the same value until
+            # ``or_atr_ratio`` is retired from the picker.
+            "score": or_atr_ratio,
             # Quality score: OR range / session-scale ATR. Higher = larger
             "or_atr_ratio": or_atr_ratio,
         }

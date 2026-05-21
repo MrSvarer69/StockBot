@@ -11,6 +11,7 @@ still in force.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from decimal import Decimal
 
@@ -134,7 +135,6 @@ def _csuite_strength(value_usd: Decimal, min_value_usd: Decimal) -> float:
     cap = min_value_usd * Decimal("100")
     if value_usd >= cap:
         return 1.0
-    import math
 
     ratio = float(value_usd / min_value_usd)
     cap_ratio = float(cap / min_value_usd)

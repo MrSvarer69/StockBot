@@ -6,6 +6,456 @@
 
 ---
 
+## Where we left off (2026-05-20, late evening — insider live-refresh wired; user has set the target architecture as THREE separate bots)
+
+This session diagnosed why today's paper-trading run did not place any trades, and built live-refresh for the insider data path so the same failure won't happen again. The user then declared the architectural target they want: **three separate, independently runnable bots — ORB, Insider, and a Midday trader.** The Midday trader does not exist yet and is the main outstanding build.
+
+### The diagnosis from today's run
+
+The user launched the bot twice (17:43 CEST and 20:26 CEST = 11:43 ET and 14:26 ET — both well after the 09:30 ET open) and saw only `skipping stale signal` warnings, no fills. Investigation confirmed:
+
+1. **All "stale signal" warnings were ORB signals**, including `side: short` rows for GOOGL/BABA/TSLA/LLY/UNH that cannot have come from `InsiderStrategy` (long-only). Spread of timestamps (10:00–11:05 ET across symbols) is the natural ORB breakout-time spread. Correct freshness-gate behavior for an opening-only strategy launched midday.
+2. **`InsiderStrategy` emitted zero signals.** `scripts/probe_insider_today.py` (new, kept) showed `signals with effective_entry_date == today: 0`. Root cause: the Form 4 parquet cache at `data/insider/` had a latest `filing_date` of **2026-05-15**, five days stale. `_next_trading_day(2026-05-15) = 2026-05-18`, so no signal in the cache had an `effective_entry_date >= today`.
+3. **Alpaca IEX feed was healthy.** `scripts/probe_bars_freshness.py` (new, kept) showed last bars within ~1 minute of wall-clock for SPY/QQQ/NVDA/TSLA/AMZN/JPM/ARM/WSBC. The feed was never the problem.
+4. The user originally claimed they launched at 15:30 CEST (= 09:30 ET, the open). Audit-log filenames disprove this — earliest log today is `20260520T154357Z.jsonl` (17:43 CEST). No log file from 13:30 UTC exists. Either an earlier launch failed silently before logging, or memory of the time is off. Worth confirming with shell history next session.
+
+### What was built this session
+
+**Live refresh for the Form 4 cache** — addresses the design gap that `InsiderStrategy` loaded parquet only at construction and never re-checked EDGAR. The user explicitly chose **startup pre-flight + 15-min in-session refresh** when asked.
+
+- `src/trading_bot/data/insider/refresh.py` (new) — `refresh_cache_to_today(client, cache, ticker_map, lookback_days=7, today=None)` wraps `run_backfill` over a rolling 7-day window. Resumable, so repeated calls are cheap.
+- `src/trading_bot/data/insider/__init__.py` — exports `refresh_cache_to_today`.
+- `src/trading_bot/strategy/insider/strategy.py` — new `InsiderStrategy.reload()` method. Re-reads parquet, re-runs both detectors, atomically swaps in the new `_signals_by_entry_date`. Logs `n_signals_delta`. Returns the new total signal count.
+- `src/trading_bot/execution/session.py` — `SessionConfig` gets `refresh_interval_minutes: int | None = None` and `refresh_hook: Callable[[], None] | None = None` (validated in `__post_init__` — non-callable hook or non-positive interval raises at construction). `SessionState` gets `last_refresh_at: datetime | None = None`. Main loop fires the hook at the top of each iteration (after the market-open check, before `get_account`) when the interval has elapsed; exceptions are absorbed and `last_refresh_at` is advanced on failure to prevent EDGAR-outage log-spam.
+- `scripts/run_paper.py` — new flags `--insider-refresh-minutes` (default 15, 0 disables) and `--no-insider-preflight` (default: pre-flight is on). Pre-flight runs `refresh_cache_to_today` BEFORE constructing `InsiderStrategy`, so the in-memory index at session start reflects everything filed up to launch. In-session hook closes over the same `(client, cache, ticker_map)` and calls `refresh_cache_to_today` followed by `insider_strategy.reload()`.
+
+**Important constraint to remember**: the anti-lookahead rule in `strategy/insider/strategy.py:21-25` means a filing published *during today's session* cannot trigger a same-day entry. It becomes tradable at tomorrow's 10:00 ET. The in-session refresh therefore primarily benefits *tomorrow's* signal set. The startup pre-flight is what fixes today's specific failure mode.
+
+**Tests (all passing):**
+
+- `tests/test_strategy/insider/test_strategy_adapter.py` — 2 new tests: `test_reload_picks_up_new_filings_written_to_parquet`, `test_reload_with_empty_parquet_root_clears_index`.
+- `tests/test_execution/test_session.py` — 6 new tests: `test_refresh_hook_fires_on_first_iteration_when_due`, `test_refresh_hook_skipped_when_interval_not_elapsed`, `test_refresh_hook_failure_does_not_halt_session`, `test_refresh_hook_disabled_when_interval_none`, `test_refresh_hook_rejects_non_callable`, `test_refresh_interval_rejects_nonpositive`.
+- Full `tests/test_execution/` + `tests/test_strategy/insider/` suites green (121 + 49 tests respectively). Pre-existing failure in `tests/test_strategy/test_orb.py::test_filter_audit_log_emits_or_atr_and_cold_start` is unchanged — fails the same way on unmodified `main`.
+
+**Diagnostic scripts kept in `scripts/` (gitignored content unchanged, but the scripts themselves are new files):**
+
+- `scripts/probe_bars_freshness.py` — prints the last-bar timestamp and row count from `AlpacaPaperBroker.get_recent_bars` for a handful of liquid names. Use to disambiguate "data feed is stale" from "strategy is buggy" when investigating a no-trade session.
+- `scripts/probe_insider_today.py` — prints how many `InsiderStrategy` signals are dated for today's `effective_entry_date` plus the next 5 upcoming dates. Use to confirm whether the insider arm has anything to trade today before assuming a wiring bug.
+
+### Risk-officer review on this session's change
+
+Invoked at the end of the build. **Initial verdict: BLOCK** — but the block was driven by pre-existing uncommitted changes already in the working directory before this conversation started, not by anything built this session. The blockers the risk-officer flagged that are NOT mine:
+
+1. **`SessionConfig.flatten_on_exit` default flipped `True → False`** at `session.py:101`. Travels in the diff because the 2026-05-19 stop/take work touched it. Test fixtures at `tests/test_execution/test_session.py:43` already pass `flatten_on_exit=False` explicitly, masking the default flip in the suite. Risk-officer correctly notes this is a safety-default regression that needs explicit justification — flagged in the 2026-05-19 handover section below but the change still sits in the diff uncommitted.
+2. **`_check_stops_and_takes`** at `session.py:734-811`. Pre-existing from 2026-05-19 work. Already risk-officer-reviewed in that session.
+3. **`--no-flatten` → `--flatten-on-exit`/`--no-flatten-on-halt`** CLI rename in `run_paper.py`. Pre-existing from 2026-05-19. Operator runbooks referencing the old flag would silently no-op.
+
+For the refresh-hook change *in isolation*, the risk-officer's verdict was APPROVE WITH NITS. Nits applied this session:
+
+- `refresh_hook` typed as `Callable[[], None] | None` instead of `object | None`.
+- `SessionConfig.__post_init__` validates callable + positive interval at construction so misconfiguration fails fast instead of logging a refresh-failure forever.
+- Runtime budget documented in the `SessionConfig` docstring — hook must return well inside `poll_interval_seconds` (recommended ≤30s for the 60s default).
+
+**Net**: this session's refresh-hook change is risk-approved on its own merits. The three pre-existing items above remain open and were already flagged in the 2026-05-19 handover below.
+
+---
+
+### Target architecture (set by user this session): three separate, independently runnable bots
+
+The user has stated the end-state they want:
+
+| Bot | Status | Strategy | Window |
+| --- | --- | --- | --- |
+| **ORB trader** | EXISTS, runs today | `ORBStrategy` at `src/trading_bot/strategy/orb/strategy.py` | Opening hour (09:30–~11:00 ET) |
+| **Insider trader** | EXISTS, now with live cache refresh | `InsiderStrategy` at `src/trading_bot/strategy/insider/strategy.py` | Fires at 10:00 ET on filings whose `effective_entry_date` matches today |
+| **Midday trader** | **DOES NOT EXIST YET** — needs to be designed and built | TBD — see open questions below | Mid-session (roughly 11:00–14:00 ET, the gap between the ORB window and the close-of-day) |
+
+**What "separate bots" means is not yet decided.** The user said "3 separate bots" but did not specify the deployment shape. There are two reasonable readings, and the next session must pick one with the user before any code is written:
+
+| Option | What it is | Pros | Cons |
+| --- | --- | --- | --- |
+| **A. Three processes, one composite each** | Spawn three `run_paper.py` instances, each constructed with a single strategy (no `CompositeStrategy` wrapping). Each has its own audit log, its own `SessionState`, its own broker client. | Maximum isolation — a bug or hang in one bot cannot stop the others. Audit logs are cleanly per-strategy. Easy to A/B by simply not launching one. | Three Alpaca clients hammer the same paper account; rate limits could surface. Three independent `open_entries` and `realized_pnl_today` views — no shared kill-switch on daily loss. Three sets of `UNRECONCILED_*.json` sentinel files. Three startup pre-flight backfills (harmless, the cache is idempotent). |
+| **B. One process, three named strategies in `CompositeStrategy`** | Keep today's `CompositeStrategy` shape. Add the Midday strategy as a third inner. `--no-orb`/`--no-insider`/`--no-midday` flags let the operator turn any of the three on/off without changing the deployment. | Single broker session, single shared risk cap, single audit log — much easier to reason about daily P&L and the kill switch. No new infrastructure. Already the shape `run_paper.py` is built for. | Not "separate bots" in the literal sense — they share a session. A logic bug in any one strategy can in principle affect the others (in practice, conflict resolution at `composite.py:144-176` already isolates entries). |
+
+**My (Claude's) recommendation**: Option B with strict per-strategy attribution. The risk boundary in this project is shared capital — one bot, three strategies, one daily-loss kill-switch. Option A's headline isolation is appealing but reproduces the kill-switch + position-cap state across three processes, which is actively dangerous: a runaway in one bot can't be stopped by the others' caps. The 2026-05-19 handover already lists `Trade.strategy_id` as the missing piece for per-strategy P&L attribution — if we land that, Option B gives the user everything Option A promises without the shared-cap regression.
+
+**User has not picked yet.** Do not start building the Midday strategy until they pick A vs B, because the wiring is different.
+
+### Midday strategy — what to design (when the user gives the go-ahead)
+
+Properties the design needs:
+
+- **Fires throughout the mid-session window (roughly 11:00 ET to ~14:00 ET).** The user's frustration today was that ORB owns the open and Insider fires at 10:00 ET, but nothing covers the rest of the session. Signals should be available on every poll iteration in the window, not just at one specific time.
+- **Clear stop + take on every entry signal.** The bracket contract at `execution/alpaca_paper.py:206` requires both. No naked entries.
+- **No overnight thesis.** Project is daytrade-only per CLAUDE.md.
+- **`score: float` in [reasonable bounded range]** comparable to ORB's `or_atr_ratio` and Insider's `strength`, so the cross-strategy picker at `strategy/picker.py` can rank candidates from all three on the same axis.
+
+Candidate strategies (from the 2026-05-19 handover, all rejected on backtest then revisited with `csuite_conviction`-style cleanups still possible):
+
+1. **VWAP reclaim / rejection** — already implemented at `src/trading_bot/strategy/vwap/strategy.py` and **failed the acceptance bar** per `memory/project_afternoon_strategy_failures.md`. Code is there but not wired. Could be revisited with tighter filters, a different universe, or as a "weak signal only fires when no other strategy has a candidate" mode.
+2. **Rolling range breakout (RRB)** — also implemented at `src/trading_bot/strategy/rrb/strategy.py` and also failed acceptance. Same situation as VWAP.
+3. **Pullback to moving average after a trending move** — not yet implemented. Probably the most promising untried idea.
+4. **5-min RSI mean reversion** — not yet implemented. High-frequency but historically nasty drawdowns. Lowest priority.
+
+The user's memory `memory/project_afternoon_strategy_failures.md` explicitly notes that VWAP and RRB both failed on the SPY/NVDA/AAPL/JPM universe. If we resurrect either, it needs a different universe or a different acceptance bar, justified up-front. **Strategist agent should propose a fresh design rather than re-running VWAP/RRB without changes.**
+
+### Decisions the user must make before the Midday build starts
+
+1. **Option A or Option B** for the "3 separate bots" architecture (see table above).
+2. **Which Midday strategy concept.** Revisit a failed one with tighter rules, or design something new (e.g., pullback-to-MA)?
+3. **Universe for the Midday bot.** Same wide universe as today? A different cohort (e.g., higher-beta names where mid-session moves are larger)? Universe choice is load-bearing — VWAP/RRB might pass on a different universe even though they failed on SPY/NVDA/AAPL/JPM.
+4. **Picker behavior across three strategies.** Today the picker keeps top-N by `or_atr_ratio` from the composite. With three strategies all emitting on the same poll, does the user want strict per-strategy quotas (e.g., max 2 from ORB, 2 from Insider, 1 from Midday) or pure score-based selection? Tied to whether Option A or B is chosen.
+
+### Pre-existing risk-officer concerns still open (not addressed this session)
+
+These were flagged in the 2026-05-19 session and remain in the working directory uncommitted:
+
+- `SessionConfig.flatten_on_exit` default flipped to `False` — needs an explicit justification or a revert. Risk-officer correctly notes test fixtures mask the default flip.
+- `Trade.strategy_id` for per-strategy P&L attribution — required if Option B is chosen for the 3-bot architecture. Without it, daily P&L lumps strategies together.
+- Reconciliation step at session start for stale `sess.open_entries` when a bracket child fires while the bot is offline.
+- Persist `open_entries` to disk so bot-side stop/take enforcement survives a restart (without it, only broker bracket children guard rollover positions).
+- Gate `--no-flatten-on-halt` behind a `TRADING_MODE=live` refusal whenever live trading is enabled.
+
+### Suggested first move next session
+
+> "Before any code: confirm Option A (three processes) vs Option B (one process, three strategies). Then pick the Midday strategy concept and universe. Then the strategist agent designs it, the backtester validates it, and only then is it wired into `run_paper.py` or a new entrypoint. Pre-flight: verify the insider refresh is doing what it should by tailing this morning's audit log and checking the `insider cache refresh starting`/`InsiderStrategy reloaded` lines fire ~every 15 minutes."
+
+### One thing to verify on the next morning launch
+
+Today's failure was the insider cache being 5 days stale. The pre-flight refresh built this session should fix that automatically on every launch, but the *first* launch after this change is the one to verify. Look for these new INFO lines in the audit log on next startup:
+
+- `insider pre-flight refresh starting (last 7 days)`
+- `insider cache refresh starting` (then `... done` with `filings_fetched` > 0 if anything new was filed since 2026-05-15)
+- `InsiderStrategy reloaded` (every 15 minutes during the session)
+
+If `filings_fetched` is 0 even though days have passed since the last cache write, EDGAR or the rate-limited client is wedged and the insider arm will still emit nothing — at which point inspect `data/insider_raw/` for the most recent fetch and `EdgarClient` logs.
+
+---
+
+## Where we left off (2026-05-20, evening — composite ORB + InsiderStrategy wired into run_paper.py; late-launch bug fixed)
+
+This session validated, killed, and re-attempted the midday-coverage strategy three times. Final state: a working composite (ORB + Form 4 insider) wired into `scripts/run_paper.py`, with universe widened to 56 tickers and the InsiderStrategy adapter's late-launch bug fixed. Bot was launched twice today but both launches were after the morning ORB window had already fired; user has not yet observed a real intraday trade fire from the new composite.
+
+### Status check — first thing to do next session
+
+1. Ask: "Did you launch the bot tomorrow morning before 15:30 Danish time (09:30 ET / 13:30 UTC)?" — that's the only window where ORB signals are fresh.
+2. If yes, read the most recent `data/ops/logs/<run>.jsonl`. Look for:
+   - `InsiderStrategy constructed` (already confirmed firing on launch)
+   - Any `submitting order` lines with `symbol` in the insider-track regional banks (CBC, WSBC, GABC, SFNC, FMBM, BWFG, CIVB, MIAX) or insider-track adds (EMN, MTDR, SPG, COO, NSP) — proves the insider arm fired and the picker selected it.
+   - Whether `or_atr_ratio` for those insider signals is in [0, 1] (insider strength) vs the ORB signals where it's typically > 0.5 — confirms the picker is seeing both signal classes correctly.
+3. If insider signals fire too rarely, that's the next decision point — widen the universe further toward the small-cap regional bank cohort (CBKM, AVBH, AVBC, GBLI, ATLO etc., all <$500M) or accept ORB-dominant flow.
+
+### What was built this session
+
+**Backtests (three rounds, all bar one negative):**
+
+- VWAP on original universe (SPY/NVDA/AAPL/JPM) — PF 0.55-1.12 at 1bp; score corr 0.03-0.04. FAIL.
+- RRB (Donchian-style breakout) on original universe — PF 0.62-0.88 at 1bp; score corr 0.0102 on N=2202. FAIL. Lookback ablation (30/60/120) didn't rescue.
+- ORB/RRB/VWAP all on high-vol mega-cap universe (TSLA/AMD/COIN/MARA/MSTR/NVDA) — only ORB cleared (PF > 1.0 on 4/6 strict). RRB and VWAP both failed again.
+- Form 4 insider strategies (cluster_buy, csuite_conviction) on data/insider/ parquet cache — aggregate PF positive across all 6 (strategy × holding) cells (1.33-7.62), but N≤58 per cell vs N>=200 bar. Score correlations noisy (-0.40 to +0.20).
+
+The user explicitly authorized taking the underpowered-but-positive insider result to live paper trading rather than wait for more historical data.
+
+**Composite integration (this session's main build):**
+
+- `src/trading_bot/strategy/composite.py` — `CompositeStrategy` wraps N inner strategies under the existing `Strategy` Protocol. Conflict resolution: same-(timestamp, symbol) entries dedup by highest `score` with priority-order tiebreak. `flat` signals always pass through unchanged so per-strategy exit logic still runs.
+- `src/trading_bot/strategy/insider/strategy.py` — `InsiderStrategy` adapter. Loads parquet at construction, runs both detectors, indexes signals by `effective_entry_date` (next trading day after `max_filing_date` — anti-lookahead). On each `generate_signals(bars)` call emits one entry at the latest bar at-or-after `entry_et` ET plus a forced flat `holding_days` later (default 10 days).
+- `src/trading_bot/strategy/base.py` — added `score: float64` to `empty_signals_frame()`. ORB/VWAP/RRB all updated to emit `score = or_atr_ratio` for backward compat with the picker. The picker still reads `or_atr_ratio`; migration to `score` is deferred.
+- `src/trading_bot/strategy/insider/gates.py` — patched to drop sentinel-string tickers ("NONE"/"N/A"/empty/whitespace) which were 193 of 828 cached signals (~23% data quality bug from the parser).
+- `src/trading_bot/strategy/insider/cluster_buy.py` and `csuite_conviction.py` — added `max_filing_date` to the signal `metadata` dict so the adapter can derive the effective entry date.
+- `scripts/run_paper.py` — instantiates `CompositeStrategy([ORBStrategy(...), InsiderStrategy(...)], names=["orb", "insider"])`. New CLI flags `--no-orb` / `--no-insider` for diagnostic isolation runs. Default `--symbols` widened from 24 to **56 names** with insider-track regional-bank additions documented inline.
+
+**Late-launch bug fix (after user's first launch attempt revealed it):**
+
+The user launched the bot twice today, both times after the morning ORB window. The first launch (~15:43 UTC) hit the documented one-shot ORB problem; the second launch (~20:26 UTC) was after market close. Both surfaced 18-25 "skipping stale signal" warnings. Investigation showed `InsiderStrategy.generate_signals` was anchoring to the **first** bar at-or-after 10:00 ET on each date, meaning any insider signal it emitted was instantly stale once the bot launched after ~10:05 ET — same failure mode as ORB by design.
+
+Fix at `src/trading_bot/strategy/insider/strategy.py:272` and `:301`: use the **latest** bar at-or-after `entry_et` instead of the first. Signals stay fresh on every poll iteration; the session's `open_entries` dedup prevents double-entries. New test `test_entry_anchors_to_latest_bar_for_freshness` pins this behavior.
+
+**Tests:**
+
+- 293 pass + 1 pre-existing known failure (`test_filter_audit_log_emits_or_atr_and_cold_start`, unchanged).
+- New test files: `tests/test_strategy/test_composite.py` (11 tests), `tests/test_strategy/insider/test_strategy_adapter.py` (10 tests including the new late-launch test), `tests/test_strategy/insider/test_strategy_adapter_integration.py` (`@pytest.mark.integration`, skips if `data/insider/` is empty), `tests/test_strategy/insider/test_form4_gates.py` (NONE/N/A sentinel filter).
+- `pyproject.toml` — registered the `integration` pytest marker.
+
+**Memory:**
+
+- `memory/project_afternoon_strategy_failures.md` — updated to capture the 5-strategy attempt history, the universe-mismatch caveat, and that the user authorized taking the underpowered insider result to live paper.
+
+### Universe state — what's in `--symbols` and why
+
+56 tickers total in `_WIDE_UNIVERSE_DEFAULT`:
+
+- **Index/sector ETFs:** SPY, QQQ, IWM, XLE, XLF, GLD
+- **AI/semis:** NVDA, AMD, MU, AVGO, SMCI, MRVL, ARM
+- **Mega-cap tech:** AAPL, MSFT, META, GOOGL, AMZN, NFLX, ORCL, CRWD, SNOW, SHOP, BABA
+- **Financials:** JPM, GS
+- **Crypto/high-vol:** COIN, MSTR, RIOT, HOOD, TSLA
+- **Diversifiers:** ABNB, BA, LLY, LMT, DIS, NKE, UNH, RBLX, PLTR, FCX, CVX, XOM
+- **Insider-track adds (high signal density, mid/large-cap):** EMN, MTDR, SPG, COO, NSP
+- **Insider-track regional banks + others:** CBC, WSBC, GABC, FMBM, SFNC, BWFG, CIVB, MIAX
+
+Explicit exclusions: MARA (PF 0.68 + microstructure, per 2026-05-20 backtest). Considered-and-rejected: AVBH, AVBC, AEBI, MKZR, AMRZ, STSS, BETA, MSDL (ambiguous ticker identities without an API lookup), ATLO/QNBC/CBKM (sub-$200M market caps).
+
+### The universe-mismatch caveat (load-bearing)
+
+Form 4 insider signals surface ~257 unique tickers in the cached window. Even with the 13 insider-track additions, the overlap between insider-surfaced tickers and `--symbols` is small. The InsiderStrategy adapter at `strategy.py:286-289` silently skips signals for tickers not in the bars frame — and bars are fetched only for `--symbols`. So the insider track will fire rarely in live paper trading until either (a) `--symbols` is widened to ~50+ small-cap regional banks (less liquid for paper fills but reasonable at $5k position sizes), or (b) the adapter is rebuilt to dynamically subscribe to bars for surfaced tickers (significant new infrastructure).
+
+The user has not picked (a) or (b) yet. Default behavior right now: ORB-dominant flow with occasional insider fires on the ~6-7% overlap names.
+
+### Deferred (do NOT do without risk-officer review)
+
+These were on the original HANDOVER.md plan but explicitly deferred this session because they touch `execution/`, `risk/`, or `contracts.py`:
+
+- `Trade.strategy_id` field on `src/trading_bot/contracts.py` for per-strategy P&L attribution.
+- Plumbing of `strategy_id` through `sess.open_entries` and `_record_exit` at `src/trading_bot/execution/session.py`.
+- Migrating the picker at `src/trading_bot/strategy/picker.py` from `or_atr_ratio` to the new `score` column. Currently both columns carry the same value, so this is cosmetic for the moment.
+- Live EDGAR polling for new filings mid-session (adapter currently reads the static parquet only — last backfill 2026-05-17, ran ~10 hours overnight per the prior session's note).
+- Reconciliation step at session start for stale `sess.open_entries` rows when a bracket child fires while the bot was offline (flagged by risk-officer in the 2026-05-19 session, still open).
+
+### Open questions for the user
+
+1. **Insider universe expansion.** Is `--symbols` good as-is, or should we widen to capture more Form 4 signals? The smallest-cap insider regional banks (sub-$500M) trade on real volume but have wider spreads — paper fills will be optimistic relative to live.
+2. **Per-strategy P&L attribution.** Without `Trade.strategy_id`, end-of-session P&L lumps ORB and insider trades together. For diagnosis you can grep logs by symbol (ORB hits the mega-cap allowlist; insider hits the regional bank cohort) — but a real attribution column is the proper fix and needs a risk-officer-approved Trade schema change.
+3. **What to do if insider fires zero times.** If the next live session shows zero insider entries, the universe-mismatch is real and the user needs to pick (a) widen `--symbols`, (b) build dynamic ticker subscription, or (c) accept ORB-only and use the morning launch window strictly.
+
+### Suggested first move next session
+
+> "Confirm tomorrow's morning launch fired ORB cleanly and report whether any insider entries appeared in the logs. Then pick a direction on the universe-mismatch caveat — widen `--symbols`, build dynamic subscription, or accept the current overlap."
+
+### Hard rules still in force (from CLAUDE.md, unchanged)
+
+- Paper-only default. `TRADING_MODE=paper`.
+- No forecasts in outputs.
+- No git operations from Claude.
+- Pure functions in `strategy/`. Adapter's parquet-load-at-construction is the documented exception.
+- Both `stop_price` and `take_price` must be set on every entry signal (bracket contract at `execution/alpaca_paper.py:206`). InsiderStrategy honors this via synthetic ATR-derived stop/take.
+- Pre-existing `tests/test_strategy/test_orb.py::test_filter_audit_log_emits_or_atr_and_cold_start` failure is known and unrelated.
+
+---
+
+## Where we left off (2026-05-19, late afternoon — stop/take enforcement wired; second intraday strategy is the next build)
+
+This session diagnosed and fixed a real wiring gap (stops/takes were computed but never enforced), then surfaced the next problem to solve: the bot only generates entry signals during the opening hour, so launching mid-day produces nothing.
+
+The user wants a **second intraday-friendly strategy** built so that missing the open is no longer fatal. **Do not start building it yet — they asked for a handover only.** This section is the brief.
+
+### Status check — first thing to do next session
+
+1. Ask: "Did you launch the bot tomorrow morning before 13:30 UTC (09:30 ET)?" — confirms they had a clean ORB run after this session's stop/take fix.
+2. Read the most recent `data/ops/logs/<run>.jsonl`. Confirm:
+   - `stop/take triggered` lines appear (or don't, depending on price action) — proves `_check_stops_and_takes` runs.
+   - Entry `submitting order` lines now include `"order_class": "bracket"` and `stop_price`/`take_price` fields — proves bracket children are attached at the broker.
+3. If they then ask about Strategy #2, work through the open questions below.
+
+### What was built this session
+
+**Stop/take enforcement** (touches `execution/`, risk-officer approved twice):
+
+- `src/trading_bot/execution/alpaca_paper.py:206` — `submit_order` attaches bracket children (`OrderClass.BRACKET` + `StopLossRequest` + `TakeProfitRequest`) whenever a `ProposedOrder` carries both `stop_price` and `take_price`. Falls back to OTO when only one is set, plain market when neither is set.
+- `src/trading_bot/execution/session.py:712` — new `_check_stops_and_takes` helper. Runs once per poll iteration before signals process: fetches latest price for each open `sess.open_entries[symbol]`, closes on breach via `cancel_orders_for` (kills the bracket children) → `close_position` → `_record_exit` with `exit_reason="stop"` or `"take"`. Stop wins over take if both are simultaneously breached.
+
+**Flatten gate split** (also `execution/`, also risk-officer approved):
+
+- `SessionConfig.flatten_on_exit` default **changed from `True` to `False`** — applies on clean exit only (manual SIGINT, market close, max_iterations).
+- New `SessionConfig.flatten_on_halt: bool = True` — applies on fault-class halt (kill switch, broker auth/validation, consecutive failures, mid-sleep failures).
+- Gate logic at `session.py:1283-1289`: reads `sess.halt_reason` to pick which knob applies.
+- CLI in `scripts/run_paper.py`: `--no-flatten` replaced with `--flatten-on-exit` (opt-in) and `--no-flatten-on-halt` (discouraged opt-out).
+
+**Tests**: 71/71 pass in `tests/test_execution/`. 13 new tests for stop/take + bracket submission + flatten matrix.
+
+**Risk-officer follow-up flags (non-blocking):**
+1. If a bracket child fires while the bot is offline, the position vanishes server-side but `sess.open_entries` keeps the stale row until session-end — no `Trade` record is written. Safety-wise fine (capital not at risk; new entries re-check broker positions); observability gap. Worth a reconciliation step at session start later.
+2. `open_entries` is in-memory only. With `flatten_on_exit=False`, positions roll across restarts but their stop/take levels are lost — only the broker bracket guards them on the next session. Persist `open_entries` to disk if the user wants bot-side enforcement to survive a restart.
+3. In any future move toward live trading, gate `--no-flatten-on-halt` behind a `TRADING_MODE=live` refusal.
+
+### Why the user wants Strategy #2 — the actual problem
+
+ORB ("Opening Range Breakout") emits its entry signal **once per day per symbol**, in the first ~30–90 minutes after open. Today the user launched at 14:39 ET (18:39 UTC) and saw 14 "skipping stale signal" log lines and zero entries. Working as designed (the `max_signal_age_minutes=5` guard exists for the 2026-05-14 wash-trade reason — *do not lower it*), but it means the bot is useless after the morning window.
+
+User's ask: a second strategy that **fires throughout the session** so a 14:00 ET launch still finds work, layered alongside ORB rather than replacing it.
+
+### Decisions the user has made on this build (do NOT re-litigate)
+
+- **Layered, not replacement.** ORB stays as-is. Strategy #2 runs in the same session, sharing risk/execution/picker plumbing.
+- **Independence from the insider track.** This is unrelated to the Form 4 pipeline. Both can coexist; the insider work is its own thing.
+- **Don't lower `max_signal_age_minutes`.** That guard exists for a reason. The fix is a strategy with fresh intraday signals, not weaker freshness checks.
+
+### Strategy candidates worth proposing (rank order)
+
+The strategist agent should pick one to design first. Properties needed: **emits signals across the session, not just at the open; clear stop/take rule (the new bracket wiring expects both); no overnight thesis (project is daytrade-only).**
+
+1. **VWAP reclaim / rejection** — long when price closes back above VWAP from below (with N-bar confirmation); short on rejection from above. Strong fit: VWAP is the most-used institutional intraday benchmark; signals fire continuously; pairs naturally with ORB (ORB plays the breakout direction at the open; VWAP plays mean reversion later). Stop = N×ATR; take = R-multiple of stop distance. **Recommended starting point.**
+2. **Range breakout (rolling, not opening)** — same mechanic as ORB but with a sliding N-minute reference window instead of a fixed opening-range. Conceptually closest to ORB; could share a lot of code; but signals can fire on choppy ranges and need a volume/volatility filter.
+3. **Pullback to moving average** — after a trending move (defined by slope / consecutive higher-highs), enter on a pullback to a configurable MA (e.g., 20-period EMA on 5-min bars). Good signal density; needs a "what counts as a trend" filter that's tunable without lookahead bias.
+4. **5-min RSI mean reversion** — buy oversold (RSI<25) / sell overbought (RSI>75) inside the session. High signal frequency, but mean-reversion strategies have notoriously sharp drawdowns; would need tight stops. Probably the riskiest of the four; mention but don't start here.
+
+### Architectural fit — what needs to change to run two strategies in one session
+
+Today `run_session(broker, strategy, config, risk_params, ...)` takes a single `Strategy` (Protocol at `src/trading_bot/strategy/base.py:10`). Three plausible refactors:
+
+| Option | What it is | Pros | Cons |
+| --- | --- | --- | --- |
+| **A. CompositeStrategy wrapper** | A `CompositeStrategy` that holds N inner strategies, calls `generate_signals` on each, concatenates results, tags `strategy_id`. Implements the same `Strategy` Protocol. | Zero churn in `run_session`. Easy to test each strategy in isolation. | Per-symbol conflict resolution lives inside the wrapper, not the session. |
+| **B. `run_session` takes a list** | Change signature to `strategies: list[Strategy]`. Session loops over them. | Conflict resolution happens at the session layer where the picker already lives. | Touches `execution/` — needs risk-officer review; breaks every existing test signature. |
+| **C. Run two `run_session` processes** | Spin up two independent sessions, each with its own strategy. | Maximum isolation; no shared bugs. | Two broker clients, two sets of `open_entries`, can't share the position cap. **Don't do this.** |
+
+**Recommended: Option A (CompositeStrategy).** Minimal churn, isolation per strategy, single session = shared risk cap. The strategist agent should design this.
+
+### Open questions the user needs to decide before / during the build
+
+1. **Which strategy first?** Recommend VWAP reclaim (see ranking above), but the strategist agent should validate against the existing backtest engine's capabilities.
+2. **Same-symbol same-iteration conflict resolution.** If ORB says LONG SPY and VWAP says SHORT SPY in the same poll, what happens? Options: (a) earlier strategy wins (ORB always first), (b) higher-`or_atr_ratio`-equivalent wins, (c) suppress both. The existing `_handle_entry_signal` *already* skips entries when a position exists (`session.py:649`), so the second-iteration case is handled; only the first-iteration tie needs a rule.
+3. **Ranking score across strategies.** The picker (`src/trading_bot/strategy/picker.py:27`) ranks by `or_atr_ratio` — an ORB-specific field. The handover for the build needs to spec a generic `score: float` column on the SignalsFrame that every strategy emits, comparable across strategies. Otherwise the picker can only rank within a strategy.
+4. **Per-strategy or shared position cap?** Recommend shared (capital is one pool; current `max_position_count=5` is already a total cap). Don't introduce per-strategy caps unless backtests reveal one strategy crowds out the other.
+5. **Trade tagging.** `Trade` (`contracts.py:107`) has no `strategy_id`. Needed so the end-of-session table and any later overlap analysis can attribute P&L by strategy. Schema change is small and additive (default to `"orb"` for back-compat).
+
+### What to build, in order
+
+1. **Strategist agent**: design the chosen strategy's signal rule, stop/take, and parameters. Output: `src/trading_bot/strategy/<name>/{config,strategy}.py` matching the ORB layout.
+2. **Strategist + base.py**: add `score: float` to `empty_signals_frame()` and require all strategies to emit it (ORB can wrap `or_atr_ratio` into `score`). Keep `or_atr_ratio` for ORB-specific debugging.
+3. **Strategist**: build `CompositeStrategy` in `src/trading_bot/strategy/composite.py` — implements `Strategy` Protocol, concatenates child signals, tags `strategy_id`, handles same-symbol same-iteration ties with a configurable resolver (default: highest `score` wins; ties broken by `strategy_id` priority order).
+4. **Backtester agent**: backtest the new strategy in isolation. Verify it actually produces signals at non-opening times. Compare metrics to ORB.
+5. **Backtester**: backtest the composite. Verify the composite ≈ sum of individual unless conflicts trigger (then docs explain the suppression).
+6. **`contracts.Trade` + session.py**: add `strategy_id: str = "orb"` to `Trade`. Plumb through `sess.open_entries` and `_record_exit`. Tests for the new column in the end-of-session table.
+7. **Wire `scripts/run_paper.py`**: instantiate `CompositeStrategy([ORBStrategy(...), <New>Strategy(...)])`. Add CLI flags to disable either strategy (`--no-orb`, `--no-<name>`) for diagnostic runs.
+8. **Risk-officer review**: required because step 6 touches `execution/` (Trade schema, `_record_exit` plumbing). Step 7 just touches `scripts/`, no review needed.
+
+### Pre-existing issue still hanging around
+
+`tests/test_strategy/test_orb.py` was reported failing on `main` in the 2026-05-17 session. Not verified or fixed this session. Check whether it still fails before kicking off any new strategy work — backtesting against a broken ORB baseline would be misleading.
+
+### Suggested first move in the next session
+
+> "Confirm the bracket + poll-side stop wiring fired correctly on this morning's run. Then ask the strategist agent to design VWAP reclaim with a CompositeStrategy plan."
+
+If the user wants to skip the strategist design step and write the strategy themselves, the contracts they need to hit are: `generate_signals(bars) -> DataFrame` with the SignalsFrame columns at `src/trading_bot/strategy/base.py:16`. The new `score: float` column hasn't been added yet — they'd add it as part of step 2.
+
+---
+
+## Where we left off (2026-05-17, evening — Form 4 insider pipeline built; backfill running overnight)
+
+This session built a **completely new, independent strategy track** alongside ORB:
+insider-trade signals from SEC Form 4 filings via EDGAR. The user wants insider and ORB
+strategies kept **fully separate** (no merged signal) but compared after both have
+backtested — to see whether they ever fire on the same ticker on the same day.
+
+### Immediate state (what the user is doing right now)
+
+The user started `uv run python scripts/backfill_form4.py --months 3` and is leaving
+it running overnight in tmux. Expected runtime ~10 hours at the observed throughput.
+It is **resumable** — re-running just skips accessions already in Parquet.
+
+When the next session starts, the FIRST thing to do:
+
+1. Ask: "Did the Form 4 backfill complete? Want me to verify the data?"
+2. If yes: `uv run python -c "import pyarrow.dataset as ds; print(ds.dataset('data/insider', partitioning='hive').count_rows())"` — sanity-check row count and partition coverage (months Feb/Mar/Apr/May 2026).
+3. If no / interrupted: re-run the same command; it resumes.
+
+### The plan after the backfill is in
+
+User's stated path forward (in order):
+
+1. Verify Form 4 backfill is clean.
+2. **Build historical OHLC price ingestion** — STILL MISSING. Required for any backtest.
+   Suggested: `data-engineer` agent → `src/trading_bot/data/prices/`, Alpaca historical
+   bars (project is already Alpaca-based; same API keys), or yfinance fallback. Schema:
+   ticker, date (UTC), OHLCV, Decimal for prices.
+3. Run the insider backtest — `backtester` agent. Joins filter signals to forward
+   prices over configurable hold windows; reports computed-from-history metrics only
+   (no forecasts per CLAUDE.md).
+4. Run an ORB backtest on the same price data.
+5. **Overlap analysis**: intersection of `{(date, ticker)}` from insider signals and
+   from ORB signals. Observational only — *not* a merge.
+
+### What was built this session
+
+**Insider Form 4 ingestion** — `src/trading_bot/data/insider/`:
+- `client.py` — polite SEC HTTP client (8 req/sec, retries, on-disk raw cache, no `Accept-Encoding: gzip` because urllib doesn't auto-decompress)
+- `index.py` — quarterly `form.idx` fetch + regex-anchored row parser
+- `parser.py` — Form 4 XML → `Form4Filing` rows
+- `cache.py` — Parquet writer, hive-partitioned `year=YYYY/month=MM/`
+- `tickers.py` — CIK → ticker map from SEC's `company_tickers.json`
+- `backfill.py` — orchestrator; fetches `index.json` per filing to resolve the XML name (which is NOT `primary_doc.xml`), then the XML
+- `schema.py` — `Form4Filing` frozen dataclass + Arrow schema, 18 columns, Decimal for monetary fields
+
+**Filters** (pure functions, no I/O) — `src/trading_bot/strategy/insider/`:
+- `gates.py` — universal gates: P-code only, drop 10b5-1, drop price <$5, drop null ticker, drop filing-delay >2 biz days
+- `cluster_buy.py` — ≥3 distinct insiders within a 10-day window
+- `csuite_conviction.py` — CEO/CFO open-market buy ≥$100k with 180-day cooldown per (insider, ticker)
+
+**CLI**: `scripts/backfill_form4.py --months N --max-filings N`
+
+**Storage layout** (matters for tooling):
+- Parquet (clean root, scans via `pyarrow.dataset.dataset("data/insider", partitioning="hive")`):
+  `data/insider/year=YYYY/month=MM/part-*.parquet`
+- Raw HTTP cache (deliberately OUTSIDE the Parquet root): `data/insider_raw/`
+
+**Tests**:
+- `tests/test_data/insider/` — 16 unit tests passing
+- `tests/test_strategy/insider/` — 31 unit tests passing
+- Live EDGAR tests are `@pytest.mark.network`, opt-in only
+
+### Decisions the user has made (do NOT re-litigate)
+
+- **Insider and ORB stay independent.** Not mixed. Overlap analysis is observational.
+- **Cluster Buy + C-Suite Conviction** are the chosen insider filters. Contrarian,
+  buy/sell ratio flip, and small-cap subset were considered and parked.
+- **Parquet, not SQL.** DuckDB-on-Parquet is an acceptable future query layer.
+- **3-month backfill window** for the first pass (user wanted a faster first iteration than 12 months).
+
+### Bug history from this session (fixed but worth knowing)
+
+The data-engineer agent's first pass shipped four real bugs that all surfaced when
+the user tried to run the backfill. Each was diagnosed against live EDGAR responses:
+
+1. **gzip cache poisoning** — client advertised `Accept-Encoding: gzip, deflate` but
+   urllib doesn't auto-decompress. Gzipped bytes got cached, then JSON-decoded as
+   garbage. Fix: drop the Accept-Encoding header entirely. SEC returns identity.
+2. **`form.idx` column parsing** — real EDGAR format has a single solid run of dashes
+   for the divider (not space-separated `----  ----`) AND data columns are *wider*
+   than the header (~155 chars vs. ~107). The parser now uses a regex anchored on
+   the structural invariants (CIK = digits, date = ISO, file path starts with `edgar/`).
+3. **Form 4 XML filename is not `primary_doc.xml`** — observed in the wild:
+   `ownership.xml` (most common), `form4_*.xml`, `wk-form4_*.xml`, custom per filer
+   agent. Resolution: fetch `index.json` per filing, pick the first `.xml` that
+   isn't an index artifact. Costs 2 requests per filing.
+4. **Raw cache nested under Parquet root** — `data/insider/raw/` broke
+   `pyarrow.dataset.dataset(...)` schema inference because it tried to read the
+   raw cache as Parquet. Moved to `data/insider_raw/`.
+
+### Open semantic questions (strategist flagged; not yet resolved)
+
+Strategist picked sensible defaults but called them out:
+
+1. **Cooldown boundary**: `elapsed_days <= cooldown_days` = "still in cooldown" (day 180 suppressed, day 181 fires). Strict `<` would mean day 180 fires.
+2. **Cluster window**: inclusive `[end − 9 days, end]`, calendar days (not business days).
+3. **Multi-buy by same insider within a cluster**: collapsed to one membership entry with summed value. Distinct-insider count drives the threshold.
+4. **`signal_date` dtype**: Python `date` objects, not `datetime64[ns, UTC]`.
+
+Worth revisiting once the backtest exposes behavior — don't tune speculatively.
+
+### Operational details
+
+- Required env: `SEC_USER_AGENT="Name email@addr"` in `.env` (SEC fair-access policy)
+- Throughput: ~2 filings/sec (rate limit 8 req/sec, 2 requests per filing)
+- Resumability: re-running the script skips accessions already in Parquet AND skips raw fetches that hit the on-disk cache. Safe to Ctrl-C and resume.
+
+### Pre-existing issue surfaced (not from this session)
+
+Both data-engineer and strategist agents independently noticed
+`tests/test_strategy/test_orb.py` is failing on `main`. Not caused by insider work
+but blocks the ORB-backtest leg of the planned overlap analysis. Investigate when
+convenient — see prior handover sections below for ORB context.
+
+### Suggested first move in the next session
+
+> "Verify the Form 4 backfill, then kick off price-data ingestion via the data-engineer agent."
+
+If the user wants to skip ahead to the overlap analysis, remind them they need price
+data first — the insider Parquet alone doesn't let the backtester compute outcomes.
+
+---
+
 ## Where we left off (2026-05-14, late evening — 9-bug sweep + cache fix + cross-symbol picker)
 
 **164/164 tests pass.** No commits — git is user-handled.
@@ -621,7 +1071,7 @@ The ORB strategy is a **baseline**, not a tested edge. A 5-session backtest on S
 ## Quick orientation pointers
 
 - **Project rules:** `CLAUDE.md` (paper-only default, Decimal for money, UTC internally, no forecasts)
-- **Agents:** `.claude/agents/{data-engineer,strategist,backtester,risk-officer,ops}.md`
+- **Agents:** `.claude/agents/{data-engineer,strategist,backtester,risk-officer,ops,code-reviewer,tester}.md`
 - **Skills:** `.claude/skills/{backtest,deploy-paper,replay-trade}/SKILL.md`
 - **Memory index (auto-loaded):** `~/.claude/projects/-home-fts-Project/memory/MEMORY.md`
 - **Shared types:** `src/trading_bot/contracts.py` — start here when adding a new module
@@ -636,3 +1086,23 @@ The ORB strategy is a **baseline**, not a tested edge. A 5-session backtest on S
 > "Pick up the trading-bot handover. Run the three risk-officer follow-ups (task #13)."
 
 The fixes are scoped, the test scaffolding is in place, and finishing them gives a clean foundation for whatever comes next — strategy iteration, IBKR adapter, or live-mode design.
+
+---
+
+## 2026-05-21 cleanup
+
+The VWAP and RRB strategies (both failed their acceptance bar earlier in
+the project) were removed in full: strategy packages, configs, tests,
+backtest scripts, and the two `_*_ablation.py` probes. The active
+strategy set is now exactly **ORB + Pullback (midday) + Insider**, all
+three composed via `CompositeStrategy` in `scripts/run_paper.py`.
+
+Two new subagents were added: `code-reviewer` (general code-quality
+review for paths outside `execution/` and `risk/`) and `tester` (pytest
+infrastructure ownership). Risk-officer still owns execution/risk veto.
+
+No public contracts changed — Strategy Protocol, SignalsFrame schema,
+BrokerClient, SessionConfig, and the backtest engine are all
+byte-identical. The pre-existing failing test
+`tests/test_strategy/test_orb.py::test_filter_audit_log_emits_or_atr_and_cold_start`
+remains failing and is still owned by the strategist.

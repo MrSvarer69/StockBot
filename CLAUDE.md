@@ -43,13 +43,23 @@ data/          # local data cache (gitignored content)
 
 ## Agents
 
-Five specialized subagents live in `.claude/agents/`:
+Seven specialized subagents live in `.claude/agents/`:
 
 - `data-engineer` — ingestion, schemas, backfills
 - `strategist` — signal design, parameter exploration
 - `backtester` — runs simulations, reports metrics
 - `risk-officer` — reviews any change touching `execution/` or `risk/`; gates live mode
 - `ops` — deployment, logging, monitoring
+- `code-reviewer` — general code quality review for paths outside `execution/`/`risk/`
+- `tester` — pytest infrastructure: conftests, fixtures, markers, coverage config
+
+## Strategies
+
+Three strategies are wired into the live composite (see `scripts/run_paper.py`):
+
+- `orb` — opening-range breakout, the morning track
+- `pullback` (a.k.a. `midday`) — pullback-to-EMA midday cover
+- `insider` — Form 4 cluster-buy and C-suite conviction
 
 ## Skills
 

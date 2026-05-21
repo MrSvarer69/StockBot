@@ -14,7 +14,13 @@ class Strategy(Protocol):
 
 
 def empty_signals_frame() -> pd.DataFrame:
-    """Return a correctly-typed empty SignalsFrame."""
+    """Return a correctly-typed empty SignalsFrame.
+
+    ``score`` is the unified, strategy-agnostic conviction column used by a
+    cross-strategy picker. ``or_atr_ratio`` is retained for backward
+    compatibility with ``strategy/picker.py`` until that migration is run;
+    every strategy emits both columns with the same numeric value.
+    """
     return pd.DataFrame(
         {
             "timestamp": pd.Series(dtype="datetime64[ns, UTC]"),
@@ -23,6 +29,7 @@ def empty_signals_frame() -> pd.DataFrame:
             "target_size_pct": pd.Series(dtype="float64"),
             "stop_price": pd.Series(dtype="float64"),
             "take_price": pd.Series(dtype="float64"),
+            "score": pd.Series(dtype="float64"),
             "or_atr_ratio": pd.Series(dtype="float64"),
         }
     )

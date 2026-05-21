@@ -241,6 +241,137 @@ def test_flatten_on_exit():
     assert "SPY" in broker.closed_symbols
 
 
+def test_clean_exit_does_not_flatten_by_default():
+    """Default `flatten_on_exit=False`: a clean exit (max_iterations here)
+    leaves positions in place. Operator can re-launch and pick them back up.
+    """
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+    # _config() defaults flatten_on_exit to False — but be explicit to make
+    # the test's intent obvious even if the helper's default ever changes.
+    run_session(
+        broker,
+        _strategy(),
+        _config(max_iterations=1, flatten_on_exit=False),
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: _AFTER_ENTRY,
+        install_signals=False,
+    )
+    assert broker.closed_symbols == []
+    assert "SPY" in broker.positions
+
+
+def test_halt_flattens_by_default():
+    """A kill-switch trip sets halt_reason, which triggers flatten via
+    `flatten_on_halt=True` (default) regardless of `flatten_on_exit`."""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+    # Seed an open position from a prior iteration so the halt-flatten has
+    # something to close. The kill-file kicks in BEFORE entries fire, so we
+    # cannot rely on this run's signals to open one.
+    from trading_bot.execution.broker import BrokerPosition
+
+    broker.positions["SPY"] = BrokerPosition(
+        symbol="SPY",
+        qty=Decimal("10"),
+        avg_entry_price=Decimal("100"),
+        market_value=Decimal("1000"),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        kill_path = Path(td) / "kill"
+        kill_path.write_text("halt")
+        os.environ["TRADING_BOT_KILL_FILE"] = str(kill_path)
+        try:
+            risk = RiskParams(
+                max_pct_per_trade=Decimal("0.10"),
+                max_daily_loss_pct=Decimal("0.05"),
+                max_daily_notional_pct=Decimal("0.95"),
+                max_position_count=5,
+                symbol_whitelist=frozenset(["SPY"]),
+                kill_file_path=str(kill_path),
+            )
+            state = run_session(
+                broker,
+                _strategy(),
+                _config(max_iterations=5, flatten_on_exit=False),
+                risk,
+                sleep_fn=lambda _s: None,
+                now_fn=lambda: _AFTER_ENTRY,
+                install_signals=False,
+            )
+        finally:
+            os.environ.pop("TRADING_BOT_KILL_FILE", None)
+
+    assert state.halt_reason is not None
+    assert "SPY" in broker.closed_symbols
+
+
+def test_halt_does_not_flatten_when_flatten_on_halt_disabled():
+    """Operator opt-out: explicit `flatten_on_halt=False` skips the safety
+    flatten even on a halt. Strongly discouraged in production but supported."""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from trading_bot.execution.broker import BrokerPosition
+
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+    broker.positions["SPY"] = BrokerPosition(
+        symbol="SPY",
+        qty=Decimal("10"),
+        avg_entry_price=Decimal("100"),
+        market_value=Decimal("1000"),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        kill_path = Path(td) / "kill"
+        kill_path.write_text("halt")
+        try:
+            risk = RiskParams(
+                max_pct_per_trade=Decimal("0.10"),
+                max_daily_loss_pct=Decimal("0.05"),
+                max_daily_notional_pct=Decimal("0.95"),
+                max_position_count=5,
+                symbol_whitelist=frozenset(["SPY"]),
+                kill_file_path=str(kill_path),
+            )
+            state = run_session(
+                broker,
+                _strategy(),
+                _config(
+                    max_iterations=5,
+                    flatten_on_exit=False,
+                    flatten_on_halt=False,
+                ),
+                risk,
+                sleep_fn=lambda _s: None,
+                now_fn=lambda: _AFTER_ENTRY,
+                install_signals=False,
+            )
+        finally:
+            os.environ.pop("TRADING_BOT_KILL_FILE", None)
+
+    assert state.halt_reason is not None
+    assert broker.closed_symbols == []
+    assert "SPY" in broker.positions
+
+
 def test_broker_errors_dont_halt_loop():
     """A submit failure is per-signal, not per-iteration: counter stays at 0."""
     bars = make_synthetic_session(_SESSION_DATE, breakout="up")
@@ -2090,3 +2221,508 @@ def test_consecutive_failure_counter_resets_on_success():
     # consecutive_failures should be 0 (reset by later successful iterations).
     assert state.consecutive_failures == 0
     assert state.halt_reason is None
+
+
+# ---------------------------------------------------------------------------
+# Poll-side stop/take check
+# ---------------------------------------------------------------------------
+
+
+def _seed_open_entry(
+    sess,
+    *,
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    entry_price: Decimal,
+    stop_price: Decimal | None,
+    take_price: Decimal | None,
+) -> None:
+    import pandas as pd
+
+    sess.open_entries[symbol] = {
+        "side": side,
+        "qty": qty,
+        "entry_price": entry_price,
+        "entry_time": pd.Timestamp(_AFTER_ENTRY),
+        "stop_price": stop_price,
+        "take_price": take_price,
+    }
+
+
+def _seed_position(broker: FakeBroker, symbol: str, qty: Decimal, price: Decimal) -> None:
+    from trading_bot.execution.broker import BrokerPosition
+
+    broker.positions[symbol] = BrokerPosition(
+        symbol=symbol,
+        qty=qty,
+        avg_entry_price=price,
+        market_value=qty * price,
+    )
+
+
+def test_stop_check_closes_long_when_price_breaches_stop():
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SPY": Decimal("94")})
+    _seed_position(broker, "SPY", Decimal("10"), Decimal("100"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess,
+        symbol="SPY",
+        side="long",
+        qty=Decimal("10"),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("95"),
+        take_price=Decimal("110"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert "SPY" in broker.closed_symbols
+    assert "SPY" not in sess.open_entries
+    assert len(sess.trades) == 1
+    assert sess.trades[0].exit_reason == "stop"
+    assert sess.trades[0].side == "long"
+
+
+def test_take_check_closes_long_when_price_breaches_take():
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SPY": Decimal("111")})
+    _seed_position(broker, "SPY", Decimal("10"), Decimal("100"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess,
+        symbol="SPY",
+        side="long",
+        qty=Decimal("10"),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("95"),
+        take_price=Decimal("110"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert sess.trades[0].exit_reason == "take"
+    assert sess.trades[0].side == "long"
+
+
+def test_stop_check_closes_short_when_price_breaches_stop():
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SMCI": Decimal("32")})
+    _seed_position(broker, "SMCI", Decimal("-10"), Decimal("30"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess,
+        symbol="SMCI",
+        side="short",
+        qty=Decimal("10"),
+        entry_price=Decimal("30"),
+        stop_price=Decimal("31"),
+        take_price=Decimal("28"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert sess.trades[0].exit_reason == "stop"
+    assert sess.trades[0].side == "short"
+
+
+def test_take_check_closes_short_when_price_breaches_take():
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SMCI": Decimal("27.50")})
+    _seed_position(broker, "SMCI", Decimal("-10"), Decimal("30"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess,
+        symbol="SMCI",
+        side="short",
+        qty=Decimal("10"),
+        entry_price=Decimal("30"),
+        stop_price=Decimal("31"),
+        take_price=Decimal("28"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert sess.trades[0].exit_reason == "take"
+    assert sess.trades[0].side == "short"
+
+
+def test_stop_take_check_no_op_when_price_within_bands():
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SPY": Decimal("100")})
+    _seed_position(broker, "SPY", Decimal("10"), Decimal("100"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess,
+        symbol="SPY",
+        side="long",
+        qty=Decimal("10"),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("95"),
+        take_price=Decimal("110"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert broker.closed_symbols == []
+    assert "SPY" in sess.open_entries
+    assert sess.trades == []
+
+
+def test_stop_check_prefers_stop_when_both_breached():
+    """If a single price somehow breaches both stop and take (wide intrabar
+    move on a poorly-configured strategy), stop must win — preserving capital
+    outranks locking in a gain."""
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SPY": Decimal("90")})
+    _seed_position(broker, "SPY", Decimal("10"), Decimal("100"))
+    sess = SessionState()
+    # Pathological: long with take BELOW stop. Price 90 satisfies "<= stop=95"
+    # AND ">= take=85". The implementation evaluates stop first.
+    _seed_open_entry(
+        sess,
+        symbol="SPY",
+        side="long",
+        qty=Decimal("10"),
+        entry_price=Decimal("100"),
+        stop_price=Decimal("95"),
+        take_price=Decimal("85"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert sess.trades[0].exit_reason == "stop"
+
+
+def test_stop_check_skips_entries_without_stop_or_take():
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    broker = FakeBroker(latest_prices={"SPY": Decimal("50")})
+    _seed_position(broker, "SPY", Decimal("10"), Decimal("100"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess,
+        symbol="SPY",
+        side="long",
+        qty=Decimal("10"),
+        entry_price=Decimal("100"),
+        stop_price=None,
+        take_price=None,
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    assert broker.closed_symbols == []
+    assert "SPY" in sess.open_entries
+
+
+def test_stop_check_swallows_transient_price_lookup_error():
+    """A failed price lookup for one symbol must not abort the whole check.
+    The broker-side bracket child is the safety net for that symbol."""
+    from trading_bot.execution.broker import BrokerError
+    from trading_bot.execution.session import SessionState, _check_stops_and_takes
+
+    class FlakyPriceBroker(FakeBroker):
+        def get_latest_trade_price(self, symbol):
+            if symbol == "FLAKY":
+                raise BrokerError("transient")
+            return super().get_latest_trade_price(symbol)
+
+    broker = FlakyPriceBroker(latest_prices={"SPY": Decimal("94")})
+    _seed_position(broker, "FLAKY", Decimal("10"), Decimal("100"))
+    _seed_position(broker, "SPY", Decimal("10"), Decimal("100"))
+    sess = SessionState()
+    _seed_open_entry(
+        sess, symbol="FLAKY", side="long", qty=Decimal("10"),
+        entry_price=Decimal("100"), stop_price=Decimal("95"),
+        take_price=Decimal("110"),
+    )
+    _seed_open_entry(
+        sess, symbol="SPY", side="long", qty=Decimal("10"),
+        entry_price=Decimal("100"), stop_price=Decimal("95"),
+        take_price=Decimal("110"),
+    )
+
+    _check_stops_and_takes(broker=broker, sess=sess, sleep_fn=lambda _s: None)
+
+    # FLAKY skipped due to price-lookup failure; SPY still triggers.
+    assert "FLAKY" in sess.open_entries
+    assert "SPY" not in sess.open_entries
+    assert any(t.symbol == "SPY" and t.exit_reason == "stop" for t in sess.trades)
+
+
+# ---------------------------------------------------------------------------
+# Bracket submission via AlpacaPaperBroker
+# ---------------------------------------------------------------------------
+
+
+def test_alpaca_submit_order_attaches_bracket_children_when_stop_and_take_set():
+    """submit_order must pass order_class=BRACKET + stop_loss + take_profit
+    when both protective levels are present on the ProposedOrder."""
+    from datetime import datetime as _dt
+
+    from alpaca.trading.enums import OrderClass
+    from alpaca.trading.requests import (
+        MarketOrderRequest,
+        StopLossRequest,
+        TakeProfitRequest,
+    )
+
+    from trading_bot.contracts import OrderType, ProposedOrder
+    from trading_bot.execution.alpaca_paper import AlpacaPaperBroker
+
+    captured: dict = {}
+
+    class FakeAlpacaResp:
+        id = "abc-123"
+        client_order_id = "cid"
+        symbol = "SPY"
+        side = "buy"
+        qty = "10"
+        status = "accepted"
+        submitted_at = _dt(2026, 1, 5, 15, 30, tzinfo=UTC)
+        filled_qty = "0"
+        filled_avg_price = None
+
+    class FakeTradingClient:
+        def submit_order(self, req):
+            captured["req"] = req
+            return FakeAlpacaResp()
+
+    broker = AlpacaPaperBroker(api_key="k", api_secret="s")
+    broker._trading = FakeTradingClient()
+
+    order = ProposedOrder(
+        symbol="SPY",
+        side=OrderSide.BUY,
+        qty=Decimal("10"),
+        order_type=OrderType.MARKET,
+        stop_price=Decimal("95"),
+        take_price=Decimal("110"),
+        client_order_id="cid",
+    )
+    broker.submit_order(order)
+
+    req = captured["req"]
+    assert isinstance(req, MarketOrderRequest)
+    assert req.order_class == OrderClass.BRACKET
+    assert isinstance(req.stop_loss, StopLossRequest)
+    assert isinstance(req.take_profit, TakeProfitRequest)
+    assert float(req.stop_loss.stop_price) == 95.0
+    assert float(req.take_profit.limit_price) == 110.0
+
+
+def test_alpaca_submit_order_no_bracket_when_stop_and_take_absent():
+    """Without stop/take, the request must be a plain market order — no
+    order_class, no bracket children."""
+    from datetime import datetime as _dt
+
+    from alpaca.trading.requests import MarketOrderRequest
+
+    from trading_bot.contracts import OrderType, ProposedOrder
+    from trading_bot.execution.alpaca_paper import AlpacaPaperBroker
+
+    captured: dict = {}
+
+    class FakeAlpacaResp:
+        id = "abc-123"
+        client_order_id = "cid"
+        symbol = "SPY"
+        side = "buy"
+        qty = "10"
+        status = "accepted"
+        submitted_at = _dt(2026, 1, 5, 15, 30, tzinfo=UTC)
+        filled_qty = "0"
+        filled_avg_price = None
+
+    class FakeTradingClient:
+        def submit_order(self, req):
+            captured["req"] = req
+            return FakeAlpacaResp()
+
+    broker = AlpacaPaperBroker(api_key="k", api_secret="s")
+    broker._trading = FakeTradingClient()
+
+    order = ProposedOrder(
+        symbol="SPY",
+        side=OrderSide.BUY,
+        qty=Decimal("10"),
+        order_type=OrderType.MARKET,
+        stop_price=None,
+        take_price=None,
+        client_order_id="cid",
+    )
+    broker.submit_order(order)
+
+    req = captured["req"]
+    assert isinstance(req, MarketOrderRequest)
+    # Plain market: no bracket fields.
+    assert getattr(req, "order_class", None) in (None, "simple")
+    assert getattr(req, "stop_loss", None) is None
+    assert getattr(req, "take_profit", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Periodic refresh_hook — added 2026-05-20 alongside InsiderStrategy.reload
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_hook_fires_on_first_iteration_when_due():
+    """With refresh enabled, the very first iteration triggers the hook
+    (last_refresh_at starts None)."""
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+    calls: list[datetime] = []
+
+    def hook() -> None:
+        calls.append(datetime.now(UTC))
+
+    state = run_session(
+        broker,
+        _strategy(),
+        _config(
+            max_iterations=1,
+            refresh_interval_minutes=15,
+            refresh_hook=hook,
+        ),
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: _AFTER_ENTRY,
+        install_signals=False,
+    )
+    assert state.iterations == 1
+    assert len(calls) == 1
+    assert state.last_refresh_at == _AFTER_ENTRY
+
+
+def test_refresh_hook_skipped_when_interval_not_elapsed():
+    """A second iteration at the same wall-clock time should not re-fire
+    the hook — it only fires when refresh_interval_minutes have elapsed."""
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+    calls = 0
+
+    def hook() -> None:
+        nonlocal calls
+        calls += 1
+
+    state = run_session(
+        broker,
+        _strategy(),
+        _config(
+            max_iterations=2,
+            refresh_interval_minutes=15,
+            refresh_hook=hook,
+        ),
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: _AFTER_ENTRY,  # frozen clock
+        install_signals=False,
+    )
+    assert state.iterations == 2
+    # First iteration triggers (None -> due). Second iteration with the
+    # same clock value is well under the 15-min interval, so no re-fire.
+    assert calls == 1
+
+
+def test_refresh_hook_failure_does_not_halt_session():
+    """An exception inside the hook is logged + absorbed; the loop continues
+    and last_refresh_at is still advanced so the bot does not spin-retry
+    every iteration during an EDGAR outage."""
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+
+    def bad_hook() -> None:
+        raise RuntimeError("EDGAR is down")
+
+    state = run_session(
+        broker,
+        _strategy(),
+        _config(
+            max_iterations=1,
+            refresh_interval_minutes=15,
+            refresh_hook=bad_hook,
+        ),
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: _AFTER_ENTRY,
+        install_signals=False,
+    )
+    assert state.iterations == 1
+    assert state.halt_reason is None
+    assert state.last_refresh_at == _AFTER_ENTRY
+
+
+def test_refresh_hook_disabled_when_interval_none():
+    """refresh_interval_minutes=None disables the hook entirely (even if
+    refresh_hook is set)."""
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("100")},
+    )
+    calls = 0
+
+    def hook() -> None:
+        nonlocal calls
+        calls += 1
+
+    state = run_session(
+        broker,
+        _strategy(),
+        _config(
+            max_iterations=2,
+            refresh_interval_minutes=None,
+            refresh_hook=hook,
+        ),
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: _AFTER_ENTRY,
+        install_signals=False,
+    )
+    assert state.iterations == 2
+    assert calls == 0
+    assert state.last_refresh_at is None
+
+
+def test_refresh_hook_rejects_non_callable():
+    """SessionConfig validates at construction so a misconfigured hook
+    surfaces immediately rather than logging a refresh failure forever."""
+    with pytest.raises(TypeError, match="refresh_hook must be callable"):
+        SessionConfig(
+            symbols=["SPY"],
+            refresh_hook="not a function",  # type: ignore[arg-type]
+            refresh_interval_minutes=15,
+        )
+
+
+def test_refresh_interval_rejects_nonpositive():
+    """refresh_interval_minutes must be a positive int or None."""
+    with pytest.raises(ValueError, match="must be a positive int"):
+        SessionConfig(
+            symbols=["SPY"],
+            refresh_interval_minutes=0,
+            refresh_hook=lambda: None,
+        )
+    with pytest.raises(ValueError, match="must be a positive int"):
+        SessionConfig(
+            symbols=["SPY"],
+            refresh_interval_minutes=-5,
+            refresh_hook=lambda: None,
+        )

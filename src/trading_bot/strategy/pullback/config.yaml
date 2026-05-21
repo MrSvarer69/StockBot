@@ -1,0 +1,60 @@
+session_start_et: "09:30"
+session_end_et: "16:00"
+flat_by_et: "15:55"
+# Open-to-close window. The 200-EMA warmup means the earliest *effective*
+# entry is around 12:50 ET (09:30 + 200 1-min bars), so values lower than
+# that have no behavioural effect today -- they are kept at 09:30 so a
+# future shorter-EMA config does not silently re-introduce the time gate.
+# Latest entry at 15:30 ET trades off "more entries" against "less runway
+# to the 2R take" -- entries after 15:30 would mostly resolve on the
+# 15:55 flat rather than at stop/take.
+earliest_entry_et: "09:30"
+latest_entry_et: "15:30"
+
+# EMA periods (in 1-min bars). 50 vs 200 captures a longer-horizon trend
+# than the 20 vs 50 first cut -- on 1-min bars, 50 vs 50 was firing on
+# any tiny noise drift. 200 bars ~= the prior 200 minutes ~= most of a
+# session, which lets the slow EMA actually anchor to a regime.
+ema_fast_period: 50
+ema_slow_period: 200
+
+# Slope confirmation: EMA_fast must be rising vs ~30 bars ago for longs
+# (mirrored for shorts). Avoids entering a "trend" that is already
+# rolling over.
+trend_slope_lookback: 30
+
+# Minimum (EMA_fast - EMA_slow) / ATR_bar at the entry bar. Volatility
+# normalised so it is comparable across symbols. Filters out chop where
+# the EMAs cross but the gap is small relative to single-bar moves.
+# 2.0 was the clean baseline in the 11:00-14:00 backtest (NVDA, MU
+# survivors); pushing to 2.5 with the open-to-close window did not
+# recover the lost OOS edge -- the dilution from afternoon entries is
+# structural to the wider window, not a knob away.
+min_trend_strength: 2.0
+
+# Pullback window. The strategy looks back 20 bars (~20 min) for a real
+# excursion away from EMA_fast. At least 5 of those bars must be on the
+# wrong side, and the max excursion must exceed 1.5 x bar-ATR -- a deeper
+# pullback in a strong trend is the higher-quality setup empirically.
+pullback_lookback_bars: 20
+min_pullback_bars: 5
+pullback_min_atr: 1.5
+
+# Reclaim trigger: 3 consecutive closes back on the trend side. Pins
+# down a sustained turn rather than a single-bar wick.
+reclaim_confirm_bars: 3
+
+# Bar-scale ATR + stop/take. 1.5x ATR stop and 2.0R take gives a 3R/1.5R
+# = 2:1 reward/risk ratio. Break-even win rate at 1bp slippage is
+# 1 / (1 + 2.0) = 33.3%.
+atr_period_bars: 14
+atr_stop_multiplier: 1.5
+take_r_multiple: 2.0
+
+target_size_pct: 0.10
+
+# 60-minute cooldown ensures at most one entry per hour per symbol.
+# At 6.5h session and 3h entry window = 3 max entries per symbol per day.
+cooldown_minutes: 60
+
+allow_short: true

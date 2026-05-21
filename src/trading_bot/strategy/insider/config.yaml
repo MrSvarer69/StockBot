@@ -1,0 +1,58 @@
+# Insider-trading session adapter — config for the parquet-loading adapter
+# that turns date-level insider filings into bar-aligned SignalsFrame rows.
+#
+# The two underlying detectors (cluster_buy, csuite_conviction) have their
+# own thresholds wired in here. Both keep their published defaults, except
+# where the live session requires a different choice.
+
+# Filesystem root containing the partitioned Form 4 parquet cache.
+parquet_root: "data/insider"
+
+# Toggle individual detectors. If both are false the adapter emits nothing
+# from generate_signals (still construction-valid; useful for tests).
+use_cluster_buy: true
+use_csuite: true
+
+# cluster_buy thresholds
+cluster_min_insiders: 3
+cluster_window_days: 10
+
+# csuite_conviction thresholds. min_value_usd is parsed to Decimal at load.
+csuite_min_value_usd: "100000"
+csuite_cooldown_days: 180
+
+# Number of trading days to hold an insider position. cluster_buy showed its
+# best PF cell at 10 days; csuite peaked at 20. 10 is the compromise: longer
+# holds risk the next session forcing an unrelated flat (the session loop
+# closes everything at flat_by_et anyway), and the live session is intra-day
+# so the holding_days field controls how many session-ends we let elapse
+# before forcing a flat exit. In practice for a live paper session, the
+# session-end flat at 15:55 will fire before holding_days elapses, but the
+# flag is preserved for multi-session adapters.
+holding_days: 10
+
+# Per-trade notional. Matches ORB so the shared risk cap behaves uniformly.
+target_size_pct: 0.10
+
+# Bar-scale ATR period (BARS, not sessions). 14 is the textbook ATR default
+# (Wilder, 1978).
+atr_period_bars: 14
+
+# Stop = entry_close - atr_stop_multiplier * atr_bar.
+# Wider than ORB's 1.5 because the insider signal has no natural intra-day
+# stop level — we are buying because of a multi-day filing pattern, not a
+# bar-level breakout. A tight stop is more likely to be knocked out by
+# random intraday noise than by the underlying thesis being wrong.
+atr_stop_multiplier: 2.5
+
+# Take = atr_take_r_multiple * (entry - stop) distance. 2.0R matches ORB.
+atr_take_r_multiple: 2.0
+
+# Entry time of day (ET). 09:30 = market open. The adapter uses the LATEST
+# bar at-or-after entry_et on each generate_signals() call, so the signal
+# stays fresh on every poll iteration -- a bot launched mid-session can
+# still take today's insider position. Conflicts with ORB on the same
+# symbol/minute are resolved by CompositeStrategy's score-based dedup
+# (insider scores in [0,1] vs ORB's [0.5, 2.5] mean ORB will usually win
+# the bar; in practice the two strategies pick different symbols anyway).
+entry_et: "09:30"
