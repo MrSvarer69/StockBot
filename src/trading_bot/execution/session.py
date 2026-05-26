@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
@@ -37,7 +38,7 @@ from ..ops.trade_table import (
     render_trade_event,
     render_trade_table,
 )
-from ..risk import size_position, validate_order
+from ..risk import ratchet_stop, size_position, trail_offset, validate_order
 from ..risk.kill_switch import check_daily_loss, check_kill_env, check_kill_file
 from ..strategy.base import Strategy
 from ..strategy.picker import rank_entry_signals
@@ -150,6 +151,12 @@ class SessionConfig:
     # still advanced so a failing hook does not spin-retry every iteration.
     refresh_interval_minutes: int | None = None
     refresh_hook: Callable[[], None] | None = None
+    # Per-strategy trailing-stop policy: strategy name → enabled. The session
+    # reads this at entry time using the `strategy` column on the signal row
+    # and stamps the trail state into open_entries when enabled. Missing keys
+    # default to disabled. Defaults empty (no trailing); the runner builds the
+    # dict from each strategy's enable_trailing_stop config field.
+    trailing_stop_policy: Mapping[str, bool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Fail fast on a misconfigured hook. Without this, a non-callable
@@ -217,6 +224,11 @@ class SessionState:
     # Wall-clock timestamp of the last successful refresh_hook invocation.
     # None until the first refresh fires (or always, if refresh is disabled).
     last_refresh_at: datetime | None = None
+    # Copy of SessionConfig.trailing_stop_policy stashed at session start so
+    # the helpers (`_record_entry`, `_check_stops_and_takes`) can look up
+    # per-strategy trail enablement without threading SessionConfig through
+    # every call site.
+    trailing_stop_policy: Mapping[str, bool] = field(default_factory=dict)
 
 
 def _install_signal_handlers(state: SessionState) -> None:
@@ -508,12 +520,16 @@ def _record_entry(
     side: str,
     order: ProposedOrder,
     resp: BrokerOrderResponse,
+    *,
+    strategy: str = "",
 ) -> None:
     """Stash an open-entry record and print a live ENTRY line to stdout.
 
     Pairs with `_record_exit` when the strategy emits a flat signal or
     `_flatten_all` closes the position at session end. Symbols that the
-    bot did not open in this session are not tracked.
+    bot did not open in this session are not tracked. ``strategy`` is the
+    producing bot's name ("orb"|"pullback"|"insider"|"") and rides through
+    to the eventual Trade record + log lines so trades can be attributed.
     """
     entry_price = (
         resp.filled_avg_price
@@ -531,6 +547,22 @@ def _record_entry(
         )
         entry_price = Decimal("0")
     entry_time = pd.Timestamp(resp.submitted_at)
+    # Stash trailing-stop state if the producing strategy opts in AND a stop
+    # was set at entry. trail_offset is a fixed dollar distance computed once
+    # from entry_price and the initial stop; the ratchet engine in
+    # `_check_stops_and_takes` uses it to recompute the stop each poll while
+    # never letting it move against the position.
+    trail_enabled = bool(
+        sess.trailing_stop_policy.get(strategy, False)
+        and order.stop_price is not None
+        and entry_price > 0
+    )
+    if trail_enabled:
+        offset = trail_offset(entry_price, order.stop_price, side)
+        trail_extreme = entry_price
+    else:
+        offset = Decimal("0")
+        trail_extreme = entry_price
     sess.open_entries[symbol] = {
         "side": side,
         "qty": order.qty,
@@ -538,6 +570,10 @@ def _record_entry(
         "entry_time": entry_time,
         "stop_price": order.stop_price,
         "take_price": order.take_price,
+        "strategy": strategy,
+        "trail_enabled": trail_enabled,
+        "trail_offset": offset,
+        "trail_extreme": trail_extreme,
     }
     line = render_trade_event(
         event="ENTRY",
@@ -548,12 +584,14 @@ def _record_entry(
         timestamp=entry_time,
         stop_price=order.stop_price,
         take_price=order.take_price,
+        strategy=strategy,
     )
     print(line, flush=True)
     logger.info(
         "trade entry",
         extra={
             "symbol": symbol,
+            "strategy": strategy,
             "side": side,
             "qty": str(order.qty),
             "entry_price": str(entry_price),
@@ -590,6 +628,7 @@ def _record_exit(
     exit_time = pd.Timestamp(resp.submitted_at)
     qty = entry["qty"]
     side = entry["side"]
+    strategy = entry.get("strategy", "")
     if side == "long":
         pnl = (exit_price - entry["entry_price"]) * qty
     else:
@@ -604,6 +643,7 @@ def _record_exit(
         qty=qty,
         pnl=pnl,
         exit_reason=exit_reason,
+        strategy=strategy,
     )
     sess.trades.append(trade)
     line = render_trade_event(
@@ -615,12 +655,14 @@ def _record_exit(
         timestamp=exit_time,
         pnl=pnl,
         reason=exit_reason,
+        strategy=strategy,
     )
     print(line, flush=True)
     logger.info(
         "trade exit",
         extra={
             "symbol": symbol,
+            "strategy": strategy,
             "side": side,
             "qty": str(qty),
             "exit_price": str(exit_price),
@@ -749,7 +791,9 @@ def _handle_entry_signal(
     resp = broker.submit_order(decision.order)
     sess.cumulative_notional_today += abs(order.qty) * current_price
     resp = _await_fill(broker, resp, sleep_fn=sleep_fn)
-    _record_entry(sess, symbol, side_str, decision.order, resp)
+    raw_strategy = sig.get("strategy", "")
+    strategy = "" if raw_strategy is None or (isinstance(raw_strategy, float) and pd.isna(raw_strategy)) else str(raw_strategy)
+    _record_entry(sess, symbol, side_str, decision.order, resp, strategy=strategy)
     return resp
 
 
@@ -788,6 +832,70 @@ def _check_stops_and_takes(
             )
             continue
         side = entry["side"]
+        # Trailing-stop ratchet: update the per-position high/low water mark
+        # using the latest trade price, recompute the trailing stop level,
+        # and if it has moved in our favor, replace the broker-side stop leg
+        # before re-checking the trigger. The broker bracket is the safety
+        # net for intrabar moves the polling cadence misses.
+        if (
+            entry.get("trail_enabled")
+            and stop is not None
+            and entry.get("trail_offset") is not None
+        ):
+            extreme = entry["trail_extreme"]
+            new_extreme = (
+                max(extreme, price) if side == "long" else min(extreme, price)
+            )
+            if new_extreme != extreme:
+                entry["trail_extreme"] = new_extreme
+            new_stop = ratchet_stop(
+                side=side,
+                current_stop=stop,
+                extreme_price=new_extreme,
+                offset=entry["trail_offset"],
+            )
+            if new_stop != stop:
+                try:
+                    replaced = broker.replace_stop_price(symbol, new_stop)
+                except (BrokerAuthError, BrokerValidationError):
+                    raise
+                except BrokerError:
+                    logger.exception(
+                        "trailing-stop replace failed; keeping prior stop",
+                        extra={
+                            "symbol": symbol,
+                            "attempted_stop": str(new_stop),
+                        },
+                    )
+                    replaced = False
+                if replaced:
+                    old_stop = stop
+                    entry["stop_price"] = new_stop
+                    stop = new_stop
+                    trail_line = render_trade_event(
+                        event="TRAIL",
+                        symbol=symbol,
+                        side=side,
+                        qty=entry["qty"],
+                        price=price,
+                        timestamp=datetime.now(UTC),
+                        stop_price=new_stop,
+                        reason=f"from {old_stop}",
+                        strategy=entry.get("strategy", ""),
+                    )
+                    print(trail_line, flush=True)
+                    logger.info(
+                        "trailing stop ratcheted",
+                        extra={
+                            "symbol": symbol,
+                            "strategy": entry.get("strategy", ""),
+                            "side": side,
+                            "old_stop_price": str(old_stop),
+                            "new_stop_price": str(new_stop),
+                            "extreme_price": str(new_extreme),
+                            "price": str(price),
+                        },
+                    )
         triggered: str | None = None
         if side == "long":
             if stop is not None and price <= stop:
@@ -1088,6 +1196,7 @@ def run_session(
 
     sess = SessionState()
     sess.run_id = config.run_id or now_fn().strftime("%Y%m%dT%H%M%SZ")
+    sess.trailing_stop_policy = dict(config.trailing_stop_policy)
 
     if install_signals:
         _install_signal_handlers(sess)

@@ -20,13 +20,14 @@ Intrabar resolution:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 
 import pandas as pd
 
 from ..contracts import BacktestResult, RiskParams, Side, Trade
-from ..risk import size_position
+from ..risk import ratchet_stop, size_position
 
 
 @dataclass(frozen=True)
@@ -91,10 +92,19 @@ def run_backtest(
     risk_params: RiskParams | None = None,
     costs: BacktestCosts | None = None,
     symbol: str = "SPY",
+    trailing_stop_policy: Mapping[str, bool] | None = None,
 ) -> BacktestResult:
-    """Replay `signals` against `bars`, applying risk sizing and honest fills."""
+    """Replay `signals` against `bars`, applying risk sizing and honest fills.
+
+    `trailing_stop_policy` maps a strategy name (the value emitted in a signal
+    row's ``strategy`` column — e.g. ``"orb"``, ``"pullback"``, ``"insider"``)
+    to a bool indicating whether the trailing-stop ratchet should run for
+    positions opened by that strategy. ``None`` (the default) disables the
+    trail for every strategy, preserving the engine's original behavior.
+    """
     risk_params = risk_params or RiskParams()
     costs = costs or BacktestCosts()
+    policy: Mapping[str, bool] = trailing_stop_policy or {}
 
     if bars.empty:
         return BacktestResult(
@@ -112,6 +122,10 @@ def run_backtest(
     open_stop: float | None = None
     open_take: float | None = None
     open_round_trip_fees = Decimal("0")
+    open_strategy: str = ""  # Bot name from the entry signal; rides into the resulting Trade.
+    open_trail_enabled: bool = False
+    open_trail_offset: Decimal = Decimal("0")
+    open_trail_extreme: Decimal = Decimal("0")
 
     equity_curve: dict[pd.Timestamp, float] = {}
     trades: list[Trade] = []
@@ -165,12 +179,53 @@ def run_backtest(
                     else None
                 )
                 open_round_trip_fees = round_trip_fees
+                raw_strategy = pending_entry.get("strategy", "")
+                open_strategy = "" if raw_strategy is None or (isinstance(raw_strategy, float) and pd.isna(raw_strategy)) else str(raw_strategy)
+                trail_enabled_for_strategy = bool(
+                    policy.get(open_strategy, False)
+                    and open_stop is not None
+                )
+                if trail_enabled_for_strategy:
+                    open_trail_enabled = True
+                    open_trail_offset = (
+                        Decimal(str(entry_px)) - Decimal(str(open_stop))
+                        if side == "long"
+                        else Decimal(str(open_stop)) - Decimal(str(entry_px))
+                    )
+                    open_trail_extreme = Decimal(str(entry_px))
+                else:
+                    open_trail_enabled = False
+                    open_trail_offset = Decimal("0")
+                    open_trail_extreme = Decimal(str(entry_px))
             else:
                 skipped_signals += 1
             pending_entry = None
 
         # 2) Intrabar stop/take check.
         if open_side is not None and open_entry_time is not None and open_entry_time != ts:
+            # Ratchet the trailing stop using the bar's worst-case extreme
+            # (high for longs, low for shorts) BEFORE resolving stops/takes.
+            # Within a single bar OHLC alone cannot tell us the path, so we
+            # update the extreme conservatively and let the (possibly
+            # tightened) stop participate in the intrabar resolution.
+            if open_trail_enabled and open_stop is not None:
+                if open_side == "long":
+                    open_trail_extreme = max(
+                        open_trail_extreme, Decimal(str(bar_high))
+                    )
+                else:
+                    open_trail_extreme = min(
+                        open_trail_extreme, Decimal(str(bar_low))
+                    )
+                new_stop_dec = ratchet_stop(
+                    side=open_side,
+                    current_stop=Decimal(str(open_stop)),
+                    extreme_price=open_trail_extreme,
+                    offset=open_trail_offset,
+                )
+                # Engine carries stop as float for OHLC comparisons; keep types
+                # consistent with the rest of the loop.
+                open_stop = float(new_stop_dec)
             exit_px, exit_reason = _resolve_intrabar(
                 open_side,
                 bar_high,
@@ -193,6 +248,7 @@ def run_backtest(
                         qty=open_qty,
                         pnl=gross - open_round_trip_fees,
                         exit_reason=exit_reason,
+                        strategy=open_strategy,
                     )
                 )
                 open_side = None
@@ -202,6 +258,10 @@ def run_backtest(
                 open_stop = None
                 open_take = None
                 open_round_trip_fees = Decimal("0")
+                open_strategy = ""
+                open_trail_enabled = False
+                open_trail_offset = Decimal("0")
+                open_trail_extreme = Decimal("0")
 
         # 3) Process signal at this bar (effects pending for next bar's open).
         sig = sig_by_time.get(ts)
@@ -222,6 +282,7 @@ def run_backtest(
                             qty=open_qty,
                             pnl=gross - open_round_trip_fees,
                             exit_reason="time",
+                            strategy=open_strategy,
                         )
                     )
                     open_side = None
@@ -231,6 +292,10 @@ def run_backtest(
                     open_stop = None
                     open_take = None
                     open_round_trip_fees = Decimal("0")
+                    open_strategy = ""
+                    open_trail_enabled = False
+                    open_trail_offset = Decimal("0")
+                    open_trail_extreme = Decimal("0")
                 # Drop any pending entry if a flat lands on the same bar.
                 pending_entry = None
             else:

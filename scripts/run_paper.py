@@ -23,6 +23,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from trading_bot.contracts import RiskParams
+from trading_bot.data import load_prior_session_bars
 from trading_bot.data.insider import (
     EdgarClient,
     Form4Cache,
@@ -49,28 +50,20 @@ from trading_bot.strategy.pullback import load_config as load_pullback_config
 # trusted to rank them by OR/ATR each morning and only fire the top
 # --max-concurrent-entries.
 _WIDE_UNIVERSE_DEFAULT = (
-    # Index / sector ETFs
-    "SPY,QQQ,IWM,XLE,XLF,GLD,"
-    # AI / semis
-    "NVDA,AMD,MU,AVGO,SMCI,MRVL,ARM,"
-    # Mega-cap tech / software
-    "AAPL,MSFT,META,GOOGL,AMZN,NFLX,ORCL,CRWD,SNOW,SHOP,BABA,"
-    # Financials
-    "JPM,GS,"
-    # Crypto-adjacent / high-vol
-    "COIN,MSTR,RIOT,HOOD,TSLA,"
-    # Consumer / industrial / pharma diversifiers
-    "ABNB,BA,LLY,LMT,DIS,NKE,UNH,RBLX,PLTR,FCX,CVX,XOM,"
-    # Insider-track tickers (>=5 Form 4 signals in the cached window;
-    # mid/large-cap names liquid enough for paper fills). These are added
-    # so the InsiderStrategy adapter has tradable candidates; without
-    # them the insider track would surface 0 signals (universe mismatch).
-    "EMN,MTDR,SPG,COO,NSP,"
-    # Insider-track high-signal-density names (regional banks + others).
-    # Vetted as mid/large-cap and NASDAQ/NYSE-listed; widens the universe
-    # so the InsiderStrategy adapter has more tradable candidates from the
-    # ~257 unique tickers in the cached Form 4 signals (overlap was ~6-7%
-    # against the prior 48-symbol list).
+    # Small-bankroll universe: every name kept here had a 2026-05-26
+    # observed price under ~$75/share in this session's run logs, so a
+    # $75 per-trade notional ceiling (10% of a $750 capital cap) sizes
+    # to at least 1 whole share. Higher-priced names from the prior wide
+    # universe (SPY, AAPL, NVDA, GS, MU, GLD, AMD, AVGO, TSLA, META, PLTR,
+    # BABA, etc.) are intentionally excluded — at $750 capped equity they
+    # round to qty=0 every time.
+    #
+    # Sector ETFs and high-vol momentum names in the affordable band:
+    "XLE,RIOT,SMCI,"
+    # Insider-track names confirmed sub-$75 from observed prices.
+    "EMN,MTDR,COO,NSP,"
+    # Insider-track regional banks (mid-cap NYSE/NASDAQ); typically priced
+    # in the $20-$60 band suitable for whole-share sizing on a $750 cap.
     "CBC,WSBC,GABC,FMBM,SFNC,BWFG,CIVB,MIAX"
 )
 
@@ -108,6 +101,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Total open-position cap enforced at the risk layer. Default 5. "
             "With target_size_pct=10%%, 5 positions = 50%% notional (matches "
             "max_daily_notional_pct)."
+        ),
+    )
+    p.add_argument(
+        "--max-capital-usd",
+        type=Decimal,
+        default=None,
+        help=(
+            "Hard cap on the equity used for sizing and percent-based risk "
+            "caps. Set when the paper account ($100k) is larger than the "
+            "real-world bankroll you intend to deploy. Currency is USD; "
+            "convert from local currency externally (e.g. 3000 DKK at "
+            "~6.9 DKK/USD ≈ $435). Default: no cap (raw broker equity used)."
         ),
     )
     p.add_argument(
@@ -253,11 +258,30 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     inner_strategies: list = []
     inner_names: list[str] = []
+    # Per-strategy trailing-stop policy. Keyed by the value the strategy emits
+    # in the `strategy` column of signal rows ("orb" | "pullback" | "insider"),
+    # which is what the session uses to look up trail enablement at entry.
+    trailing_stop_policy: dict[str, bool] = {}
     if not args.no_orb:
-        inner_strategies.append(ORBStrategy(load_config()))
+        orb_strategy = ORBStrategy(load_config())
+        trailing_stop_policy["orb"] = orb_strategy.config.enable_trailing_stop
+        inner_strategies.append(orb_strategy)
         inner_names.append("orb")
     if not args.no_midday:
-        inner_strategies.append(PullbackStrategy(load_pullback_config()))
+        # Pre-warm EMA buffers with the most recent prior session(s) so the
+        # pullback can fire from 09:30 ET instead of waiting ~200 minutes
+        # mid-session. Gated by PullbackConfig.warmup_from_prior_session.
+        pullback_cfg = load_pullback_config()
+        pullback_strategy = PullbackStrategy(pullback_cfg)
+        if pullback_cfg.warmup_from_prior_session:
+            today_utc = datetime.now(UTC)
+            prior_by_symbol = {
+                sym: load_prior_session_bars(sym, today_utc, min_bars=200)
+                for sym in symbols
+            }
+            pullback_strategy.set_prior_session_bars(prior_by_symbol)
+        trailing_stop_policy["pullback"] = pullback_cfg.enable_trailing_stop
+        inner_strategies.append(pullback_strategy)
         inner_names.append("midday")
 
     refresh_hook = None
@@ -288,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                     "existing cache. Today's insider signals may be stale."
                 )
         insider_strategy = InsiderStrategy(load_insider_config())
+        trailing_stop_policy["insider"] = insider_strategy.config.enable_trailing_stop
         inner_strategies.append(insider_strategy)
         inner_names.append("insider")
 
@@ -305,13 +330,30 @@ def main(argv: list[str] | None = None) -> int:
                     insider_strategy.reload()
 
     strategy = CompositeStrategy(inner_strategies, names=inner_names)
+    # Per-trade risk cap. Default 2% — the conservative guardrail tuned for a
+    # full $100k account, kept as an independent limit below target sizing.
+    # When --max-capital-usd bounds absolute dollar exposure, loosen to 10% so
+    # a small bankroll can size whole shares of sub-$75 names (2% of $750 = $15
+    # rounds every share to zero). The loosened cap is applied ONLY when a
+    # capital cap is active, so it can never widen single-trade exposure
+    # against the full uncapped paper equity.
+    max_pct_per_trade = (
+        Decimal("0.10") if args.max_capital_usd is not None else Decimal("0.02")
+    )
     risk_params = RiskParams(
-        max_pct_per_trade=Decimal("0.02"),
+        max_pct_per_trade=max_pct_per_trade,
         max_daily_loss_pct=Decimal("0.03"),
         max_daily_notional_pct=Decimal("0.50"),
         max_position_count=args.max_position_count,
         symbol_whitelist=frozenset(symbols),
+        max_capital_usd=args.max_capital_usd,
     )
+    if args.max_capital_usd is not None:
+        logging.getLogger(__name__).info(
+            "capital cap active: sizing and percent-based risk caps apply to "
+            "min(account_equity, $%s)",
+            args.max_capital_usd,
+        )
     picker_min_ratio = (
         args.picker_min_ratio if args.picker_min_ratio > 0 else None
     )
@@ -327,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id=run_id,
         refresh_interval_minutes=refresh_interval_minutes,
         refresh_hook=refresh_hook,
+        trailing_stop_policy=trailing_stop_policy,
     )
 
     run_session(broker, strategy, config, risk_params)

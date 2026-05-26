@@ -84,8 +84,10 @@ def validate_order(
             order.symbol,
         )
     else:
+        from .sizing import effective_equity
+
         proposed_notional = abs(order.qty) * px
-        daily_cap = params.max_daily_notional_pct * state.equity
+        daily_cap = params.max_daily_notional_pct * effective_equity(state.equity, params)
         if state.cumulative_notional_today + proposed_notional > daily_cap:
             return _reject(
                 f"daily notional cap hit: {state.cumulative_notional_today} + "

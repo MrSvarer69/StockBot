@@ -58,6 +58,7 @@ Constraints
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import time as dtime
 from pathlib import Path
@@ -99,6 +100,14 @@ class PullbackConfig:
     target_size_pct: float
     cooldown_minutes: int
     allow_short: bool
+    # When True, prior-session bars injected via ``set_prior_session_bars``
+    # are prepended to today's frame for indicator warmup only.
+    warmup_from_prior_session: bool = True
+    # Per-position trailing stop policy declared to the session loop. The
+    # strategy itself does not implement the ratchet; this flag tells the
+    # session layer whether to apply one. Pullback defaults True (intraday
+    # daytrade -- protect afternoon gains the same way ORB does).
+    enable_trailing_stop: bool = True
 
     @staticmethod
     def _parse_time(s: str) -> dtime:
@@ -178,6 +187,18 @@ class PullbackStrategy:
     def __init__(self, config: PullbackConfig):
         self.config = config
         self._logger = logger
+        # Symbol -> prior-session 1-min bars, injected by the runner for
+        # indicator warmup. Empty when no setter call has been made.
+        self._prior_session_bars: dict[str, pd.DataFrame] = {}
+
+    def set_prior_session_bars(
+        self, by_symbol: Mapping[str, pd.DataFrame]
+    ) -> None:
+        """Inject prior-session bars per symbol for indicator warmup; no-op when disabled."""
+        if not self.config.warmup_from_prior_session:
+            self._prior_session_bars = {}
+            return
+        self._prior_session_bars = dict(by_symbol)
 
     def generate_signals(self, bars: pd.DataFrame) -> pd.DataFrame:
         if bars.empty:
@@ -193,6 +214,9 @@ class PullbackStrategy:
         et_index = bars.index.tz_convert(ET)
         et_dates = pd.Series(et_index.date, index=bars.index)
         session_dates = sorted(et_dates.unique())
+
+        # Prior-session bars are indicator-only context; never entries.
+        prior = self._prior_session_bars.get(symbol) if cfg.warmup_from_prior_session else None
 
         rows: list[dict] = []
         for session_date in session_dates:
@@ -210,7 +234,14 @@ class PullbackStrategy:
             if session.empty:
                 continue
 
-            rows.extend(self._scan_session(session, symbol))
+            # Prepend prior-session bars (older first) for EMA / ATR warmup.
+            # The date gate inside _scan_session ensures prior bars cannot
+            # produce entry rows.
+            warmup_bars = self._prepend_prior(session, prior, session_date)
+
+            rows.extend(
+                self._scan_session(warmup_bars, symbol, entry_date=session_date)
+            )
 
         if not rows:
             return empty_signals_frame()
@@ -221,6 +252,7 @@ class PullbackStrategy:
                 "timestamp",
                 "symbol",
                 "side",
+                "strategy",
                 "target_size_pct",
                 "stop_price",
                 "take_price",
@@ -231,7 +263,7 @@ class PullbackStrategy:
 
     # --------------------------------------------------------------- scanning
     def _scan_session(
-        self, session: pd.DataFrame, symbol: str
+        self, session: pd.DataFrame, symbol: str, *, entry_date=None
     ) -> list[dict]:
         cfg = self.config
 
@@ -242,7 +274,9 @@ class PullbackStrategy:
         closes_arr = closes.to_numpy()
 
         idx = session.index
-        et_times = idx.tz_convert(ET).time
+        et_idx = idx.tz_convert(ET)
+        et_times = et_idx.time
+        et_bar_dates = et_idx.date
 
         earliest_entry = cfg.earliest_entry_time
         latest_entry = cfg.latest_entry_time
@@ -262,6 +296,9 @@ class PullbackStrategy:
         )
 
         for i in range(n):
+            # Date gate: prior-session bars are warmup-only, never entries.
+            if entry_date is not None and et_bar_dates[i] != entry_date:
+                continue
             bar_time = et_times[i]
             if bar_time < earliest_entry or bar_time >= latest_entry:
                 continue
@@ -350,8 +387,15 @@ class PullbackStrategy:
                         )
 
         # Per-session flat at first bar at/after flat_by_et so any open
-        # entry is closed before the close.
-        flat_mask = np.array([t >= flat_time for t in et_times])
+        # entry is closed before the close. Restrict to entry_date so a
+        # prepended prior session does not fire the flat twice.
+        if entry_date is not None:
+            flat_mask = np.array(
+                [t >= flat_time and d == entry_date
+                 for t, d in zip(et_times, et_bar_dates)]
+            )
+        else:
+            flat_mask = np.array([t >= flat_time for t in et_times])
         if flat_mask.any():
             first_flat = int(np.argmax(flat_mask))
             rows.append(
@@ -434,6 +478,31 @@ class PullbackStrategy:
         return bool(np.all(window_closes < window_ema))
 
     # ------------------------------------------------------------ helpers
+    def _prepend_prior(
+        self,
+        session: pd.DataFrame,
+        prior: pd.DataFrame | None,
+        session_date,
+    ) -> pd.DataFrame:
+        """Concat prior-session bars before today's session bars for warmup; returns session unchanged when no prior is available."""
+        if prior is None or prior.empty:
+            return session
+        if not isinstance(prior.index, pd.DatetimeIndex) or prior.index.tz is None:
+            return session
+        # Only keep prior bars that are strictly earlier than the entry
+        # session's ET date -- prevents accidental same-date overlap.
+        prior_et_dates = prior.index.tz_convert(ET).date
+        keep = prior_et_dates < session_date
+        prior_filtered = prior[keep]
+        if prior_filtered.empty:
+            return session
+        # Align columns with the session frame; missing columns become NaN.
+        aligned = prior_filtered.reindex(columns=session.columns)
+        combined = pd.concat([aligned, session], axis=0)
+        combined = combined[~combined.index.duplicated(keep="last")]
+        combined = combined.sort_index()
+        return combined
+
     def _row(
         self,
         ts,
@@ -448,6 +517,7 @@ class PullbackStrategy:
             "timestamp": ts,
             "symbol": symbol,
             "side": side,
+            "strategy": "pullback",
             "target_size_pct": float(self.config.target_size_pct),
             "stop_price": stop,
             "take_price": take,

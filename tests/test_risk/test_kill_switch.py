@@ -102,3 +102,31 @@ def test_kill_env_custom_var(monkeypatch):
     monkeypatch.setenv("MY_HALT", "true")
     ok, _ = check_kill_env(RiskParams(kill_env_var="MY_HALT"))
     assert not ok
+
+
+# ---------------------------------------------------------------------------
+# max_capital_usd tightens the daily-loss threshold.
+# ---------------------------------------------------------------------------
+
+
+def test_daily_loss_no_cap_does_not_trip_on_small_drawdown():
+    # 3% of $10k = $300 threshold; a $20 loss is well within it.
+    params = RiskParams(
+        max_daily_loss_pct=Decimal("0.03"),
+        max_capital_usd=None,
+    )
+    state = _state(equity=Decimal("10000"), realized_pnl_today=Decimal("-20"))
+    ok, _ = check_daily_loss(state, params)
+    assert ok
+
+
+def test_daily_loss_cap_tightens_threshold_and_trips():
+    # cap = $500 -> 3% threshold becomes $15; $20 loss now trips.
+    params = RiskParams(
+        max_daily_loss_pct=Decimal("0.03"),
+        max_capital_usd=Decimal("500"),
+    )
+    state = _state(equity=Decimal("10000"), realized_pnl_today=Decimal("-20"))
+    ok, reason = check_daily_loss(state, params)
+    assert not ok
+    assert "daily loss" in reason

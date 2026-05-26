@@ -59,6 +59,14 @@ class RiskParams:
     symbol_whitelist: frozenset[str] = field(default_factory=frozenset)
     kill_file_path: str = "data/ops/KILL"
     kill_env_var: str = "TRADING_KILL"
+    # Hard cap on the equity used for sizing and percentage-based risk caps.
+    # When set, every "% of equity" calculation in the risk module operates
+    # on min(account_equity, max_capital_usd) instead of raw broker equity.
+    # Use case: a paper account holds $100k but the operator only intends to
+    # deploy USD 500 (≈3000 DKK at ~6.9 DKK/USD) in real life — set this so
+    # backtest and paper sizing reflect that real-world ceiling. None = no
+    # cap (raw equity used; current default).
+    max_capital_usd: Decimal | None = None
 
 
 @dataclass
@@ -116,6 +124,7 @@ class Trade:
     qty: Decimal
     pnl: Decimal
     exit_reason: str  # "stop" | "take" | "time" | "session_end"
+    strategy: str = ""  # Name of the bot that produced the entry signal: "orb" | "pullback" | "insider". Default empty for old backtest fixtures.
 
 
 @dataclass

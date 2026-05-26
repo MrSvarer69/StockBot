@@ -22,13 +22,14 @@ csuite_min_value_usd: "100000"
 csuite_cooldown_days: 180
 
 # Number of trading days to hold an insider position. cluster_buy showed its
-# best PF cell at 10 days; csuite peaked at 20. 10 is the compromise: longer
-# holds risk the next session forcing an unrelated flat (the session loop
-# closes everything at flat_by_et anyway), and the live session is intra-day
-# so the holding_days field controls how many session-ends we let elapse
-# before forcing a flat exit. In practice for a live paper session, the
-# session-end flat at 15:55 will fire before holding_days elapses, but the
-# flag is preserved for multi-session adapters.
+# best PF cell at 10 days; csuite peaked at 20. 10 is the compromise.
+#
+# Insider is a multi-day swing: holding_days is the actual exit driver, and
+# positions are intentionally held across overnight session boundaries until
+# the holding horizon is reached. The strategy emits its forced flat only
+# once bars actually span ``entry + holding_days`` trading days; until then
+# the position rolls into the next session. The broker-side ATR stop/take
+# bracket order remains the overnight safety net.
 holding_days: 10
 
 # Per-trade notional. Matches ORB so the shared risk cap behaves uniformly.
@@ -56,3 +57,13 @@ atr_take_r_multiple: 2.0
 # (insider scores in [0,1] vs ORB's [0.5, 2.5] mean ORB will usually win
 # the bar; in practice the two strategies pick different symbols anyway).
 entry_et: "09:30"
+
+# Per-position trailing stop ratchet (owned by the session loop, not the
+# strategy's generate_signals). Insider defaults OFF. The insider thesis
+# is a multi-day swing held for ``holding_days`` trading days, and the
+# 2.5x ATR stop is deliberately wider than ORB's 1.5x because the signal
+# has no natural intra-day stop level. A ratchet that tightens the stop as
+# price moves favourably would knock positions out during normal multi-day
+# drawdowns that the wide stop was sized to absorb, defeating the swing
+# horizon the rest of the config is built around.
+enable_trailing_stop: false

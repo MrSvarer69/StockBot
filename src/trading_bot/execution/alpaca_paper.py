@@ -8,9 +8,21 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
+
+# Alpaca/US-equities tick rules. Limit-style prices (take-profit limit,
+# stop trigger, plain limit) must be aligned to these increments or the
+# REST API rejects with code 42210000 ("sub-penny increment"). Strategy
+# math is pure float arithmetic that routinely produces sub-penny dust
+# (e.g. 744.3450000000003 observed 2026-05-22), so quantization here is
+# the last line of defense before the wire.
+#   - price >= $1.00  →  $0.01 tick (penny)
+#   - price <  $1.00  →  $0.0001 tick (sub-penny rule for low-priced)
+_TICK_PENNY = Decimal("0.01")
+_TICK_SUBPENNY = Decimal("0.0001")
+_SUBPENNY_THRESHOLD = Decimal("1.00")
 
 from ..contracts import OrderSide, OrderType, ProposedOrder
 from ..data.bars import normalize_alpaca_bars, validate_bars
@@ -39,6 +51,19 @@ def _parse_side(raw) -> OrderSide:
     the SDK is `"sell"`/`"buy"`. Match either case-insensitively on the suffix.
     """
     return OrderSide.SELL if str(raw).lower().endswith("sell") else OrderSide.BUY
+
+
+def _quantize_to_tick(price: Decimal) -> Decimal:
+    """Round a Decimal price to the Alpaca-acceptable tick increment.
+
+    Returns the input unchanged for non-positive values — the validation
+    layer is responsible for rejecting those; we don't want quantization
+    to mask a "stop = 0" bug by silently producing 0.
+    """
+    if price <= 0:
+        return price
+    tick = _TICK_PENNY if price >= _SUBPENNY_THRESHOLD else _TICK_SUBPENNY
+    return price.quantize(tick, rounding=ROUND_HALF_UP)
 
 
 def _classify_broker_error(e: Exception, what: str) -> BrokerError:
@@ -217,6 +242,11 @@ class AlpacaPaperBroker:
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
         has_stop = order.stop_price is not None
         has_take = order.take_price is not None
+        # Quantize bracket/limit prices to broker tick BEFORE building the
+        # request payload. Strategy math is float-based and routinely emits
+        # sub-penny dust that Alpaca rejects with code 42210000.
+        stop_q = _quantize_to_tick(order.stop_price) if has_stop else None
+        take_q = _quantize_to_tick(order.take_price) if has_take else None
         bracket_kind: str | None = None
         if order.order_type == OrderType.MARKET:
             kwargs: dict = dict(
@@ -233,35 +263,28 @@ class AlpacaPaperBroker:
             # path cancels these children when the bot triggers first.
             if has_stop and has_take:
                 kwargs["order_class"] = OrderClass.BRACKET
-                kwargs["stop_loss"] = StopLossRequest(
-                    stop_price=float(order.stop_price)
-                )
-                kwargs["take_profit"] = TakeProfitRequest(
-                    limit_price=float(order.take_price)
-                )
+                kwargs["stop_loss"] = StopLossRequest(stop_price=float(stop_q))
+                kwargs["take_profit"] = TakeProfitRequest(limit_price=float(take_q))
                 bracket_kind = "bracket"
             elif has_stop:
                 kwargs["order_class"] = OrderClass.OTO
-                kwargs["stop_loss"] = StopLossRequest(
-                    stop_price=float(order.stop_price)
-                )
+                kwargs["stop_loss"] = StopLossRequest(stop_price=float(stop_q))
                 bracket_kind = "oto_stop"
             elif has_take:
                 kwargs["order_class"] = OrderClass.OTO
-                kwargs["take_profit"] = TakeProfitRequest(
-                    limit_price=float(order.take_price)
-                )
+                kwargs["take_profit"] = TakeProfitRequest(limit_price=float(take_q))
                 bracket_kind = "oto_take"
             req = MarketOrderRequest(**kwargs)
         elif order.order_type == OrderType.LIMIT:
             if order.limit_price is None:
                 raise BrokerError("limit order missing limit_price")
+            limit_q = _quantize_to_tick(order.limit_price)
             req = LimitOrderRequest(
                 symbol=order.symbol,
                 qty=float(order.qty),
                 side=side,
                 time_in_force=TimeInForce.DAY,
-                limit_price=float(order.limit_price),
+                limit_price=float(limit_q),
                 client_order_id=order.client_order_id,
             )
         else:
@@ -276,8 +299,10 @@ class AlpacaPaperBroker:
                 "type": order.order_type.value,
                 "client_order_id": order.client_order_id,
                 "order_class": bracket_kind,
-                "stop_price": str(order.stop_price) if has_stop else None,
-                "take_price": str(order.take_price) if has_take else None,
+                # Log the post-quantization values that actually go on the wire.
+                # The raw values may differ by up to half a tick (sub-penny dust).
+                "stop_price": str(stop_q) if has_stop else None,
+                "take_price": str(take_q) if has_take else None,
             },
         )
         try:
@@ -405,3 +430,92 @@ class AlpacaPaperBroker:
             logger.exception("cancel_orders failed")
             self._reset_clients()
             raise _classify_broker_error(e, "cancel_orders") from e
+
+    def replace_stop_price(
+        self, symbol: str, new_stop_price: Decimal
+    ) -> bool:
+        """Update the broker-side stop leg's stop_price for `symbol`.
+
+        Uses Alpaca's native replace endpoint so the position is never
+        briefly unprotected by a cancel+place race. Returns True on
+        successful replacement or no-op (already at the requested price);
+        returns False if there is no open stop leg to replace (position
+        already closed, bracket already fired). Raises BrokerError on
+        fatal failures.
+        """
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest, ReplaceOrderRequest
+
+        quantized = _quantize_to_tick(new_stop_price)
+
+        try:
+            orders = self._ensure_trading().get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN,
+                    symbols=[symbol],
+                )
+            )
+        except Exception as e:
+            logger.exception(
+                "get_orders failed in replace_stop_price for %s", symbol
+            )
+            self._reset_clients()
+            raise _classify_broker_error(
+                e, f"get_orders for {symbol}"
+            ) from e
+
+        # Alpaca renders a bracket's stop child as one of these order_types
+        # depending on SDK version / configuration. Use an explicit set rather
+        # than a startswith() match so `"trailing_stop"` (a distinct Alpaca
+        # family with broker-managed dynamic stops) is NOT picked up — the
+        # bot's trailing logic is intentionally bot-side; a broker-side
+        # trailing leg must not be silently overwritten by this method.
+        _STOP_LEG_TYPES = {"stop", "stop_loss", "stop_limit"}
+        stop_legs = [
+            o
+            for o in orders
+            if str(getattr(o, "order_type", "")).lower() in _STOP_LEG_TYPES
+        ]
+        if not stop_legs:
+            logger.info(
+                "replace_stop_price: no open stop leg found",
+                extra={"symbol": symbol, "new_stop_price": str(quantized)},
+            )
+            return False
+        if len(stop_legs) > 1:
+            logger.warning(
+                "replace_stop_price: multiple stop legs found; using first",
+                extra={"symbol": symbol, "count": len(stop_legs)},
+            )
+        leg = stop_legs[0]
+
+        existing = getattr(leg, "stop_price", None)
+        if existing is not None and Decimal(str(existing)) == quantized:
+            return True
+
+        try:
+            self._ensure_trading().replace_order_by_id(
+                order_id=leg.id,
+                order_data=ReplaceOrderRequest(stop_price=float(quantized)),
+            )
+        except Exception as e:
+            logger.exception(
+                "replace_order_by_id failed for stop leg %s (symbol=%s)",
+                leg.id,
+                symbol,
+            )
+            self._reset_clients()
+            raise _classify_broker_error(
+                e, f"replace_stop_price for {symbol}"
+            ) from e
+
+        logger.info(
+            "replaced stop leg",
+            extra={
+                "symbol": symbol,
+                "broker_order_id": str(leg.id),
+                "old_stop_price": str(existing) if existing is not None else None,
+                "new_stop_price": str(quantized),
+            },
+        )
+        return True

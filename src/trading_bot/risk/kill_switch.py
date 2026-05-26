@@ -12,10 +12,17 @@ logger = logging.getLogger(__name__)
 
 
 def check_daily_loss(state: AccountState, params: RiskParams) -> tuple[bool, str]:
-    """Trip when realized losses today exceed max_daily_loss_pct of equity."""
+    """Trip when realized losses today exceed max_daily_loss_pct of equity.
+
+    Uses `effective_equity` so the cap shrinks proportionally when the
+    operator has capped their deployable capital via `max_capital_usd`.
+    """
+    from .sizing import effective_equity
+
     if state.equity <= 0:
         return False, "non-positive equity"
-    limit = -abs(params.max_daily_loss_pct) * state.equity
+    capped = effective_equity(state.equity, params)
+    limit = -abs(params.max_daily_loss_pct) * capped
     if state.realized_pnl_today <= limit:
         return False, (
             f"daily loss limit hit: {state.realized_pnl_today} <= {limit}"

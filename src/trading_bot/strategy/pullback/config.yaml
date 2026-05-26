@@ -58,3 +58,16 @@ target_size_pct: 0.10
 cooldown_minutes: 60
 
 allow_short: true
+
+# When True, the runner injects prior-session bars at session start so the
+# 50/200 EMAs are warm by 09:30 ET. The strategy treats those bars as
+# indicator-only context and never produces entries from them.
+warmup_from_prior_session: true
+
+# Per-position trailing stop ratchet (owned by the session loop, not the
+# strategy's generate_signals). When true, the session layer ratchets the
+# stop in the direction of profit. Pullback defaults ON for the same reason
+# as ORB: it is a daytrade with intraday compounding, and the bracket order
+# flat by 15:55 means the strategy has no overnight risk to budget for --
+# protecting accrued profit through the afternoon is the dominant concern.
+enable_trailing_stop: true

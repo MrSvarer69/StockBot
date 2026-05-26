@@ -23,6 +23,7 @@ _EXIT_REASON_LABELS = {
 _HEADERS = (
     "#",
     "Date",
+    "Bot",
     "Side",
     "Entry (UTC)",
     "Entry $",
@@ -32,6 +33,10 @@ _HEADERS = (
     "P&L",
     "Why exited",
 )
+
+# Width of the bracketed strategy slot in render_trade_event, wide enough for
+# the longest tag — "[pullback]" — so columns stay aligned across events.
+_STRATEGY_SLOT_WIDTH = 10
 
 
 def _fmt_pnl(pnl: Decimal) -> str:
@@ -61,6 +66,7 @@ def _row_for_trade(i: int, t: Trade) -> list[str]:
     return [
         str(i),
         _fmt_date(t.entry_time),
+        t.strategy if t.strategy else "-",
         t.side,
         _fmt_time(t.entry_time),
         f"{float(t.entry_price):.2f}",
@@ -134,15 +140,18 @@ def render_trade_event(
     take_price: Decimal | None = None,
     pnl: Decimal | None = None,
     reason: str | None = None,
+    strategy: str = "",
 ) -> str:
     """One-line trade event for live console output.
 
     Shapes:
-      [HH:MM:SS] ENTRY  long  SPY  13 @ 735.26  stop=730.10 take=745.58
-      [HH:MM:SS] EXIT   long  SPY  13 @ 734.69  pnl=−7.53   reason=signal flip
+      [HH:MM:SS] [orb]      ENTRY  long  SPY  13 @ 735.26  stop=730.10 take=745.58
+      [HH:MM:SS] [pullback] EXIT   long  SPY  13 @ 734.69  pnl=−7.53   reason=signal flip
     """
     ts = timestamp.astimezone(timestamp.tzinfo).strftime("%H:%M:%S")
-    head = f"[{ts}] {event:<6} {side:<5} {symbol:<5} {_fmt_qty(qty)} @ {float(price):.2f}"
+    tag = f"[{strategy}]" if strategy else ""
+    strat_slot = f"{tag:<{_STRATEGY_SLOT_WIDTH}}"
+    head = f"[{ts}] {strat_slot} {event:<6} {side:<5} {symbol:<5} {_fmt_qty(qty)} @ {float(price):.2f}"
     tail_parts: list[str] = []
     if stop_price is not None:
         tail_parts.append(f"stop={float(stop_price):.2f}")

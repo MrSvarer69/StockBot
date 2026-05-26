@@ -69,6 +69,13 @@ class InsiderConfig:
     atr_stop_multiplier: float
     atr_take_r_multiple: float
     entry_et: str
+    # Per-position trailing stop policy declared to the session loop. The
+    # strategy itself does not implement the ratchet; this flag tells the
+    # session layer whether to apply one. Insider defaults False: the
+    # multi-day swing horizon and the wide 2.5x ATR stop are sized to
+    # absorb normal multi-day drawdowns, which a ratchet would tighten
+    # away.
+    enable_trailing_stop: bool = False
 
     @property
     def entry_time(self) -> dtime:
@@ -365,6 +372,7 @@ class InsiderStrategy:
                         "timestamp": entry_ts,
                         "symbol": ticker,
                         "side": "long",
+                        "strategy": "insider",
                         "target_size_pct": float(cfg.target_size_pct),
                         "stop_price": stop,
                         "take_price": take,
@@ -374,11 +382,12 @@ class InsiderStrategy:
                     }
                 )
 
-                # Emit a forced ``flat`` at the last bar of the
-                # holding-day session (or the last available bar in this
-                # symbol within ``bars`` if holding_days exceeds what's
-                # loaded). The session loop will still emit its own daily
-                # flat at flat_by_et — these are redundant safety nets.
+                # Insider holds across sessions; this flat only fires once
+                # we've actually accumulated ``holding_days`` trading days
+                # of bars after entry. When the loaded bars don't yet
+                # reach that horizon, no flat is emitted and the position
+                # carries into the next session (the broker-side bracket
+                # remains the overnight safety net for stop/take).
                 flat_ts = self._resolve_flat_timestamp(
                     bars=bars,
                     ticker=ticker,
@@ -391,6 +400,7 @@ class InsiderStrategy:
                             "timestamp": flat_ts,
                             "symbol": ticker,
                             "side": "flat",
+                            "strategy": "insider",
                             "target_size_pct": float(cfg.target_size_pct),
                             "stop_price": float("nan"),
                             "take_price": float("nan"),
@@ -408,6 +418,7 @@ class InsiderStrategy:
                 "timestamp",
                 "symbol",
                 "side",
+                "strategy",
                 "target_size_pct",
                 "stop_price",
                 "take_price",
@@ -423,12 +434,17 @@ class InsiderStrategy:
         entry_ts: pd.Timestamp,
         holding_days: int,
     ) -> pd.Timestamp | None:
-        """Find the latest bar for ``ticker`` that is at most
-        ``holding_days`` trading days after ``entry_ts``.
+        """Find the latest bar for ``ticker`` on the trading day exactly
+        ``holding_days`` sessions after ``entry_ts``.
 
-        Returns None when the symbol has no further bars in ``bars`` (in
-        which case the session-level flat from the run loop will close
-        the position at session end anyway).
+        Returns None when bars don't extend far enough to hit
+        ``entry_ts + holding_days`` — the position is intentionally
+        carried into the next session in that case. The broker-side
+        bracket order remains the overnight stop/take safety net, and
+        the session loop's ``flatten_on_exit=False`` default leaves the
+        position open across the session boundary so a subsequent
+        ``generate_signals`` call (with a wider bars window) can emit
+        the flat once the holding horizon is actually reached.
         """
         if "symbol" in bars.columns:
             sym_bars = bars[bars["symbol"] == ticker]
@@ -445,7 +461,13 @@ class InsiderStrategy:
         )
         if not target_dates:
             return None
-        idx = min(holding_days, len(target_dates) - 1)
+        # If bars don't cover enough trading days to reach the actual
+        # holding horizon, carry the position rather than collapsing the
+        # flat onto the last loaded bar (that bug caused same-day flats
+        # in live sessions where bars only span the current session).
+        if holding_days >= len(target_dates):
+            return None
+        idx = holding_days
         target_date = target_dates[idx]
 
         date_mask = pd.Series(

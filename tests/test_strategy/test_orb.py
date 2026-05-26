@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, time as dtime
+from zoneinfo import ZoneInfo
 
 from trading_bot.strategy import ORBStrategy, load_config
 
 from .fixtures import make_multi_session, make_synthetic_session
+
+ET = ZoneInfo("America/New_York")
 
 
 def _cfg(**overrides):
@@ -107,6 +110,10 @@ def test_min_range_filter_uses_session_scale_atr():
     (OR range ~0.05). With min_range_atr_multiplier=0.5 the threshold is
     0.5 * 10 = 5.0, far above the 0.05 OR — the current session must be
     rejected (no long/short entries).
+
+    The pre-OR proxy is explicitly disabled here so the assertion remains
+    a pure check of the OR-breakout min-range filter; the proxy path is
+    covered by its own dedicated tests below.
     """
     wide_prior = make_synthetic_session(
         date(2026, 1, 5),
@@ -121,7 +128,9 @@ def test_min_range_filter_uses_session_scale_atr():
     )
     bars = make_multi_session([wide_prior, flat_current])
 
-    strat = ORBStrategy(_cfg(min_range_atr_multiplier=0.5))
+    strat = ORBStrategy(
+        _cfg(min_range_atr_multiplier=0.5, use_prior_close_proxy=False)
+    )
     signals = strat.generate_signals(bars)
 
     current_day = date(2026, 1, 6)
@@ -202,3 +211,140 @@ def test_cold_start_does_not_block_normal_breakout():
     signals = strat.generate_signals(bars)
     longs = signals[signals["side"] == "long"]
     assert len(longs) == 1
+
+
+# -------- pre-OR proxy band ------------------------------------------------
+#
+# Prior-session math used by the four tests below (kept here so the magic
+# numbers in the fixtures are auditable):
+#   Prior session built with default or_low=99, or_high=101, breakout="up":
+#     - prior_close ≈ 101.86 (last bar close = 101.5 + 359*0.001)
+#     - prior session range ≈ 2.91 (high_max ≈ 101.91, low_min = 99.0)
+#   So with pre_or_k=0.5:
+#     upper_edge ≈ 101.86 + 0.5*2.91 ≈ 103.31
+#     lower_edge ≈ 101.86 - 0.5*2.91 ≈ 100.41
+
+
+def test_pre_or_proxy_fires_long_inside_or_window():
+    """With a prior session producing prior_close ≈ 101.86 and ATR ≈ 2.91,
+    a today-open that prints closes above ≈ 103.31 during the 09:30–10:00
+    ET window must fire exactly one long proxy entry. The current session is
+    built with or_high=104 so its first-bar oscillation hits ≈ 103.75, which
+    breaks the upper edge."""
+    prior = make_synthetic_session(date(2026, 1, 5), breakout="up")
+    today = make_synthetic_session(
+        date(2026, 1, 6),
+        breakout="up",
+        or_high=104.0,
+        or_low=99.0,
+    )
+    bars = make_multi_session([prior, today])
+
+    # allow_short=False to keep the assertion focused on the long path —
+    # the mirror short case is its own test.
+    strat = ORBStrategy(_cfg(allow_short=False, use_prior_close_proxy=True))
+    signals = strat.generate_signals(bars)
+
+    today_date = date(2026, 1, 6)
+    longs = signals[
+        (signals["side"] == "long")
+        & (signals["timestamp"].dt.date == today_date)
+    ]
+    assert len(longs) == 1
+    entry = longs.iloc[0]
+    entry_et = entry["timestamp"].tz_convert(ET).time()
+    assert dtime(9, 30) <= entry_et < dtime(10, 0), (
+        f"proxy entry must land in 09:30–10:00 ET, got {entry_et}"
+    )
+    assert entry["strategy"] == "orb"
+
+
+def test_pre_or_proxy_fires_short_inside_or_window():
+    """Mirror of the long test: prior_close ≈ 101.86, lower_edge ≈ 100.41.
+    Today's first-bar oscillation must dip below 100.41. With
+    or_high=100, or_low=95 the first close is ≈ 99.75, breaking below
+    the lower edge."""
+    prior = make_synthetic_session(date(2026, 1, 5), breakout="up")
+    today = make_synthetic_session(
+        date(2026, 1, 6),
+        breakout="down",
+        or_high=100.0,
+        or_low=95.0,
+    )
+    bars = make_multi_session([prior, today])
+
+    strat = ORBStrategy(_cfg(allow_short=True, use_prior_close_proxy=True))
+    signals = strat.generate_signals(bars)
+
+    today_date = date(2026, 1, 6)
+    shorts = signals[
+        (signals["side"] == "short")
+        & (signals["timestamp"].dt.date == today_date)
+    ]
+    assert len(shorts) == 1
+    entry = shorts.iloc[0]
+    entry_et = entry["timestamp"].tz_convert(ET).time()
+    assert dtime(9, 30) <= entry_et < dtime(10, 0), (
+        f"proxy entry must land in 09:30–10:00 ET, got {entry_et}"
+    )
+    assert entry["strategy"] == "orb"
+
+
+def test_pre_or_proxy_silent_without_prior_session_data():
+    """Graceful fallback: a single session (empty prior-session deques) must
+    not fire any proxy entries — the proxy block requires both
+    prior_session_closes and prior_session_ranges to be non-empty. The
+    standard OR-breakout path after 10:00 must still produce its one long
+    entry, demonstrating the strategy degrades gracefully to the old
+    single-OR-window behavior."""
+    bars = make_synthetic_session(date(2026, 1, 5), breakout="up")
+    strat = ORBStrategy(_cfg(use_prior_close_proxy=True))
+    signals = strat.generate_signals(bars)
+
+    entries = signals[signals["side"].isin(["long", "short"])]
+    assert len(entries) == 1
+    entry = entries.iloc[0]
+    entry_et = entry["timestamp"].tz_convert(ET).time()
+    # The lone entry must come from the OR-breakout phase (>= 10:00 ET),
+    # never from the proxy phase.
+    assert entry_et >= dtime(10, 0), (
+        f"with no prior-session data, entries must be OR-breakout (>= 10:00 ET); "
+        f"got {entry_et}"
+    )
+    assert entry["side"] == "long"
+
+
+def test_pre_or_proxy_does_not_double_fire_with_or_breakout():
+    """The `long_done` flag must be honored across the proxy → OR-breakout
+    phase boundary. Construct a setup where the 09:30 proxy fires AND the
+    after-10:00 bars would otherwise produce a clean OR-breakout long: only
+    ONE long entry must be emitted (the earlier proxy fire pre-empts the
+    OR-breakout for the same session)."""
+    prior = make_synthetic_session(date(2026, 1, 5), breakout="up")
+    # Today's session: first-bar close ≈ 103.75 breaks the proxy upper edge,
+    # AND after 10:00 the up-breakout continues so the OR-breakout phase
+    # would otherwise also fire (closes drift well above or_high=104).
+    today = make_synthetic_session(
+        date(2026, 1, 6),
+        breakout="up",
+        or_high=104.0,
+        or_low=99.0,
+    )
+    bars = make_multi_session([prior, today])
+
+    strat = ORBStrategy(_cfg(allow_short=False, use_prior_close_proxy=True))
+    signals = strat.generate_signals(bars)
+
+    today_date = date(2026, 1, 6)
+    longs = signals[
+        (signals["side"] == "long")
+        & (signals["timestamp"].dt.date == today_date)
+    ]
+    assert len(longs) == 1, (
+        f"expected exactly one long (proxy pre-empts OR-breakout), got "
+        f"{len(longs)}:\n{longs}"
+    )
+    entry_et = longs.iloc[0]["timestamp"].tz_convert(ET).time()
+    assert entry_et < dtime(10, 0), (
+        f"the surviving long must be the 09:30–10:00 proxy fire, got {entry_et}"
+    )

@@ -23,6 +23,20 @@ def _zero(reason: str, **kv) -> Decimal:
     return _ZERO
 
 
+def effective_equity(equity: Decimal, params: RiskParams) -> Decimal:
+    """Equity actually used by the risk module's percentage caps.
+
+    When ``params.max_capital_usd`` is set, returns ``min(equity, cap)`` so
+    that sizing and daily caps act as if the operator only had the capped
+    bankroll, even when the broker account holds more. Returns ``equity``
+    unchanged when no cap is configured.
+    """
+    cap = params.max_capital_usd
+    if cap is None:
+        return equity
+    return min(equity, cap)
+
+
 def size_position(
     equity: Decimal,
     target_pct: Decimal,
@@ -32,10 +46,11 @@ def size_position(
 ) -> Decimal:
     """Return whole-share quantity to trade.
 
-    Caps applied (the smallest binds):
-      1. target notional   = equity * target_pct
-      2. per-trade ceiling = equity * params.max_pct_per_trade
-      3. risk-per-trade    = (equity * params.max_pct_per_trade) / |entry - stop|
+    Caps applied (the smallest binds), where E is the capped equity (see
+    ``effective_equity``):
+      1. target notional   = E * target_pct
+      2. per-trade ceiling = E * params.max_pct_per_trade
+      3. risk-per-trade    = (E * params.max_pct_per_trade) / |entry - stop|
 
     Returns Decimal("0") on invalid inputs (non-positive equity/price, etc.)
     and logs a WARNING with the reason.
@@ -51,8 +66,12 @@ def size_position(
     if target_pct <= _ZERO:
         return _zero("non-positive target_pct", target_pct=target_pct)
 
-    target_notional = equity * target_pct
-    cap_notional = equity * params.max_pct_per_trade
+    capped_equity = effective_equity(equity, params)
+    if capped_equity <= _ZERO:
+        return _zero("non-positive capped equity", capped_equity=capped_equity)
+
+    target_notional = capped_equity * target_pct
+    cap_notional = capped_equity * params.max_pct_per_trade
     notional = min(target_notional, cap_notional)
 
     qty = notional / entry_price
@@ -63,7 +82,7 @@ def size_position(
             return _zero("non-positive stop_price", stop_price=stop)
         stop_distance = abs(entry_price - stop)
         if stop_distance > _ZERO:
-            risk_dollars = equity * params.max_pct_per_trade
+            risk_dollars = capped_equity * params.max_pct_per_trade
             risk_qty = risk_dollars / stop_distance
             qty = min(qty, risk_qty)
 

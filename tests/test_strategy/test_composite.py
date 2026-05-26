@@ -22,11 +22,13 @@ def _entry(
     score: float = 1.0,
     stop: float = 99.0,
     take: float = 102.0,
+    strategy: str = "orb",
 ) -> dict:
     return {
         "timestamp": pd.Timestamp(ts, tz="UTC"),
         "symbol": symbol,
         "side": side,
+        "strategy": strategy,
         "target_size_pct": 0.10,
         "stop_price": stop,
         "take_price": take,
@@ -35,11 +37,12 @@ def _entry(
     }
 
 
-def _flat(ts: str, symbol: str) -> dict:
+def _flat(ts: str, symbol: str, *, strategy: str = "orb") -> dict:
     return {
         "timestamp": pd.Timestamp(ts, tz="UTC"),
         "symbol": symbol,
         "side": "flat",
+        "strategy": strategy,
         "target_size_pct": 0.10,
         "stop_price": float("nan"),
         "take_price": float("nan"),
@@ -57,6 +60,7 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
             "timestamp",
             "symbol",
             "side",
+            "strategy",
             "target_size_pct",
             "stop_price",
             "take_price",

@@ -35,12 +35,12 @@ opposing entries for the same symbol at the same bar would be a
 wash-trade risk and a sign of a real strategy disagreement that wants
 operator review, not automatic execution.
 
-Out of scope (deferred)
------------------------
-A ``strategy_id`` column tagging each row with its origin would help
-downstream attribution but is intentionally NOT added here — that would
-force a session/execution-layer change which is gated separately. The
-composite emits the exact ``empty_signals_frame()`` shape.
+Attribution
+-----------
+Each inner strategy populates a ``strategy`` column on its emitted rows
+("orb", "pullback", "insider"). The composite preserves that column on
+both entry and flat rows so downstream attribution can split P&L by
+source. The composite emits the exact ``empty_signals_frame()`` shape.
 """
 
 from __future__ import annotations
@@ -133,6 +133,7 @@ class CompositeStrategy:
                 "timestamp",
                 "symbol",
                 "side",
+                "strategy",
                 "target_size_pct",
                 "stop_price",
                 "take_price",

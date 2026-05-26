@@ -6,6 +6,301 @@
 
 ---
 
+## Where we left off (2026-05-23, late evening — cheap-universe screen falsifies the $435 deployment hypothesis; one diagnostic still owed before parking)
+
+This session attempted to answer the open `$435 deployment` problem from the previous (same-day, evening) session by hunting for a cheaper universe. Conclusion: at the existing acceptance bar, no cheap-deployable symbol clears it on either ORB or pullback at honest slippage. No code changes shipped; no tests written; the work was screening-only. The next session has a single small diagnostic to run, then a clean fork: deploy a single name or park the `$435` question entirely.
+
+### Scope and method
+
+User picked Tier A + Tier B (17 cheap candidates) and authorized raising `max_pct_per_trade` to 10% (≈$43.50/trade ceiling at $435 equity). Backfilled 1-min bars for all 17 over 2025-11-15 → 2026-05-13 (the same 6-month window used in prior screens, so results compare apples-to-apples). All 17 fetched cleanly via Alpaca IEX feed; no missing symbols, no rate-limit issues.
+
+Tier A (12 liquid US-listed common / ADR): F, SOFI, PLUG, LCID, NIO, RIVN, SIRI, WBD, AAL, PBR, KGC, HL.
+Tier B (5 crypto-miner small caps): BITF, CIFR, HUT, CLSK, IREN.
+
+Also re-screened four already-cached deployable mid-tier names for comparison: RIOT, SMCI, RBLX, MARA.
+
+Slippage rationale documented inline: tick size $0.01 = ~33bp on a $3 stock; the existing 3bp stress is too generous for cheap names. Settled on **30bp as the honest stress for cheap stocks**, with a note that 10bp is more appropriate for the $20–$50 mid-tier where 1 tick is ~2–5bp.
+
+### Results — ORB
+
+Full-window at 30bp (PF > 1.0):
+
+| symbol | trades | PF | total_return% | max_dd% | last px |
+|---|---|---|---|---|---|
+| HUT | 40 | 1.62 | +3.6 | -2.5 | $108.33 |
+| F | 56 | 1.34 | +0.8 | -1.1 | $13.59 |
+| SOFI | 41 | 1.24 | +0.8 | -1.0 | $15.30 |
+| SIRI | 43 | 1.13 | +0.4 | -0.9 | $26.36 |
+| IREN | 45 | 1.07 | +0.5 | -2.8 | $55.28 |
+| KGC | 54 | 1.01 | +0.0 | -1.6 | $31.28 |
+
+IS half (2025-11-15 → 2026-02-14) and OOS half (2026-02-15 → 2026-05-13), 30bp, strict gate is PF > 1.0 in BOTH halves with ≥10 trades/half:
+
+| symbol | IS PF | OOS PF | strict pass? | price | fits $43.50? |
+|---|---|---|---|---|---|
+| HUT | 1.49 | 1.06 | ✓ | $108 | ❌ |
+| **SMCI** | **2.40** | **0.98** | ❌ (OOS misses by 0.02) | $32 | ✓ |
+| RBLX | 1.32 | 0.68 | ❌ (flip) | $42 | ✓ |
+| F | 0.60 | 2.71 | ❌ (flip) | $14 | ✓ |
+| SOFI | 1.37 | 0.79 | ❌ (flip) | $15 | ✓ |
+| SIRI | 0.84 | 1.36 | ❌ (flip) | $26 | ✓ |
+| LCID | 1.73 | 0.57 | ❌ (flip) | n/a (in cheap-only set) | ✓ |
+| KGC | 1.52 | 0.59 | ❌ (flip) | $31 | ✓ |
+| IREN | 0.65 | 1.60 | ❌ (flip) | $55 | ❌ |
+| RIOT | 0.91 | 0.75 | ❌ | $25 | ✓ |
+| MARA | 0.91 | 0.60 | ❌ (justifies existing exclusion) | $13 | ✓ |
+| HL | 1.14 | 0.58 | ❌ (flip) | n/a | ✓ |
+| Everything else | <0.85 either half | | ❌ | | |
+
+**Two key surprises:**
+
+1. **HUT looks like the gate winner but it's currently $108/share.** At 10% × $435 = $43.50 budget, you can't buy a single share. The only strict-gate pass is undeployable.
+2. **SMCI is the closest deployable near-miss** (IS 2.40, OOS 0.98 — misses by 0.02). It's also already a 2026-05-14 validated 7-name-screen survivor at the older bar. Worth flagging as the single defensible candidate IF the OOS rounding is acceptable.
+
+Regime fragility is the dominant story: IS half (Nov-Feb) and OOS half (Feb-May) systematically disagree. Almost every cheap name passes one half and fails the other.
+
+### Results — pullback
+
+`run_pullback_backtest.py` with `--slippage-bps 1.0 --stress-slippage-bps 30.0` over the same 6-month window on 21 names (17 cheap + RIOT, SMCI, RBLX, MARA): **survivors at strict gate = 0**.
+
+At 30bp stress, every cheap candidate's pullback PF dropped to 0.00–0.51. The strategy's per-trade R is too small to absorb realistic slippage at sub-$15 prices. **Pullback is structurally unviable on cheap stocks at honest slippage.** Best of the worst at 30bp: HUT (IS 0.51, OOS 0.30) — still well below 1.0, and HUT is undeployable anyway.
+
+At 1bp slippage (i.e., ignoring the cheap-stock microstructure problem), a handful of names show PF > 1.0 in one half (HUT, IREN, LCID, WBD, SIRI, MARA, CIFR) but the strict IS+OOS gate still picks zero survivors — closest is HL at 0.99/1.10.
+
+### What this means for the $435 question
+
+Empirical answer: **the cheap-universe hypothesis is falsified for the current strategies at honest slippage assumptions.** The combination of (a) higher slippage on cheap stocks, (b) strategies whose edge depends on tight slippage, (c) recent regime change between the two halves, leaves no clean deployment.
+
+Of the prior session's "realistic floor for current defaults is $5k–$10k" — this session corroborates that. SMCI at $32 is the only realistic single-name candidate, and its OOS slip just under the strict bar.
+
+### The one diagnostic still owed before parking
+
+I proposed and the user did NOT yet approve a final 10bp ORB IS/OOS screen on the deployable mid-tier (SMCI, RBLX, RIOT, F, SOFI, SIRI). Rationale: 30bp is the honest stress for sub-$10 names, but 1 tick on SMCI at $32 is only ~3bp, so 30bp = ~9 ticks of slippage is unrealistically punishing for SMCI specifically. **10bp is the price-appropriate stress for the $20–$50 mid-tier.** A cache-hit, sub-minute run.
+
+Outcomes:
+- If **SMCI clears strict IS/OOS at 10bp** → single-symbol SMCI deployment becomes defensible. Propose updating `_WIDE_UNIVERSE_DEFAULT` to `"SMCI"` and the `--max-pct-per-trade` default to 10% in `scripts/run_paper.py`, gated on user approval.
+- If **nothing clears at 10bp** → park the $435 question with high confidence. Treat the bot as paper-only learning until capital permits. Pick up the audit-log flake or a different task next.
+
+### Recommendation given to the user (still pending decision)
+
+Option 4 — park the $435 deployment question — was the recommendation, with the 10bp diagnostic as the one cheap check before committing to that. Reasoning:
+- Project's stated purpose (CLAUDE.md) is learning agents, not generating returns ("Profit from this is NOT a priority, only a nice thing.")
+- Pullback is structurally dead on cheap stocks → 1 of 3 strategies gone
+- Insider also fails this universe (Form 4 clusters live on $20–$100 regional banks, not $3 EVs)
+- ORB alone on a single near-miss name in just one regime half is a thin base
+- The realistic floor for the current strategy defaults is $5k–$10k — pushing 10–20× below that scale is the source of the problem, not the universe
+
+User responded "What would you recommend the next step being?" → my response was "the 10bp diagnostic on SMCI specifically, then a clean fork." They then said "swite the handover" (this section). **No final decision was made** on either running the diagnostic or parking the question.
+
+### Carry-forwards from the prior 2026-05-23 evening session (unchanged)
+
+These were open before this session and remain open:
+
+- **Pre-existing audit-log flake** (`test_filter_audit_log_emits_or_atr_and_cold_start`) — still the only failing test in the suite. Same shape (test caplog asks for INFO, the strategy emits at DEBUG). ~15 min for the strategist agent. Suggested follow-up if the $435 question is parked.
+- **`broker-integration` agent** at `.claude/agents/broker-integration.md` — only loads at session start, so it would be available next session for any future broker work.
+- **Capital cap (`max_capital_usd`)** is wired through risk sizing, kill-switch, and validation as of the prior session. Defaults to `None` (no cap). The `--max-capital-usd $435` flag is the deployment knob.
+- **Pre-existing risk-officer concerns** carried from earlier sessions (still open):
+  - `SessionConfig.flatten_on_exit` default flipped to `False` — needs justification or revert.
+  - Reconciliation step at session start for stale `sess.open_entries` rows when a bracket child fires while the bot was offline.
+  - Persist `open_entries` to disk so bot-side stop/take enforcement survives a restart.
+  - Gate `--no-flatten-on-halt` behind a `TRADING_MODE=live` refusal whenever live trading is enabled.
+
+### Suggested first move next session
+
+> "Either: (a) run the 10bp ORB IS/OOS screen on SMCI + RBLX + RIOT + F + SOFI + SIRI and decide between single-symbol SMCI deployment vs parking; or (b) skip directly to parking the $435 question and pick up the audit-log flake as the small follow-up. Both paths start with the user confirming which fork to take."
+
+### Data trail (for replay)
+
+Screen reports written this session, all under `data/backtests/`:
+
+- `screen-20260523T165850Z/` — ORB 1bp full-window, 17 cheap names
+- `screen-20260523T170058Z/` — ORB 30bp full-window, 17 cheap names
+- `screen-20260523T170100Z/` — ORB 30bp IS half, 17 cheap names
+- `screen-20260523T170102Z/` — ORB 30bp OOS half, 17 cheap names
+- `screen-20260523T170313Z/` — ORB 30bp IS half, 7 deployable mid-tier
+- `screen-20260523T170315Z/` — ORB 30bp OOS half, 7 deployable mid-tier
+- `pullback-20260523T170337Z/` — pullback IS/OOS at 30bp on 21 names, zero survivors
+
+### Hard rules still in force (unchanged from prior sessions)
+
+- Paper-only default.
+- No forecasts in outputs — this section reports only computed-from-history results.
+- Pure functions in `strategy/`.
+- Every order placement goes through `trading_bot.risk`.
+- Git: rule #5 now permits commits/pushes with explicit per-action operator confirmation; remote is HTTPS-only at `https://github.com/MrSvarer69/StockBot.git`. Claude does NOT push without asking.
+
+---
+
+## Where we left off (2026-05-23, evening — 5-item plan complete + capital cap added; $435 deployment shape is the open problem)
+
+This session implemented a 5-item user-defined plan plus a capital cap for student-scale deployment. All work merged into the working tree; no git operations performed (user handles git). Full suite: **363 passed, 1 failed** (still the pre-existing `test_filter_audit_log_emits_or_atr_and_cold_start` audit-log flake — verified pre-existing on `main` from prior sessions).
+
+### The 5-item plan, implemented in order 1 → 5 → 3 → 2 → 4
+
+#### 1. Insider holds overnight (`strategy/insider/`)
+
+Insider was flattening same-day because `_resolve_flat_timestamp` (`strategy.py:420-457`) clamped its target date down to the last available bar when bars didn't extend `holding_days` trading days past entry. In a live paper session bars only cover today, so the clamp always landed on today's 15:55 ET bar.
+
+Fix: when `holding_days >= len(target_dates)`, return `None` (don't emit a flat). The position carries across the session boundary; the broker-side stop bracket is the overnight safety net. Updated the docstring and the misleading comment in `insider/config.yaml:24-32` (which claimed the session loop closes everything at flat_by_et — wrong, since `flatten_on_exit=False` is the default).
+
+Tests: `test_flat_horizon_respects_bars_window_coverage` with 4 parametrized variants (carry-over / partial / exact-fit / over-fit).
+
+#### 5. Bot name on every trade log
+
+Threaded a `strategy: str` column (`"orb" | "pullback" | "insider" | ""`) end-to-end:
+
+- `empty_signals_frame()` (`strategy/base.py:16`) and every strategy's row builder (ORB and pullback both populate via the shared `_row` helper; insider builds row dicts inline so two sites were updated).
+- `strategy/composite.py` column projection preserved.
+- `Trade.strategy` field (`contracts.py:119`, default empty string for back-compat with old fixtures).
+- `session.py:_handle_entry_signal` → `_record_entry` → `open_entries[symbol]["strategy"]` → `_record_exit` → `Trade(...)` AND both `logger.info("trade entry"/"trade exit", extra={"strategy": ...})` calls. NaN-safe via the same `pd.isna` guard the backtest engine uses.
+- `backtest/engine.py` — `open_strategy` state tracked alongside the existing open-position state; both `Trade(...)` construction sites populate.
+- `ops/trade_table.py` — `render_trade_event` prefixes with `[orb]`/`[pullback]`/`[insider]` (slot width 10 matches `[pullback]`); `render_trade_table` has a new "Bot" column.
+
+Tests: `test_strategy_attribution_round_trip` (4 parametrize variants) in `tests/test_execution/test_strategy_attribution.py`. 8 composite-test fixtures updated to populate the new column.
+
+Risk-officer reviewed the `session.py` change: approved, no new order-placement paths, live-trading gate untouched.
+
+#### 3. ORB pre-OR proxy via prior close + ATR (**default OFF — backtest showed it hurt edge**)
+
+Added a pre-OR proxy path so ORB can fire entries during 09:30-10:00 ET instead of waiting for the actual opening range to complete. Uses `prior_close ± k × prior_session_ATR` as a proxy range; after 10:00 ET, the existing OR-breakout logic takes over unchanged.
+
+Implementation in `strategy/orb/strategy.py`:
+- New `prior_session_closes: deque[float]` parallel to the existing `prior_session_ranges` deque (lines 134-138, append sites mirrored at 178-179, 226-227, ~298-299).
+- Pre-OR proxy block (lines 207-216) sits between the partial-session continue and the OR-window scan.
+- `long_done`/`short_done` flags moved BEFORE the proxy block so the OR-breakout loop later in the same session honors them and doesn't double-fire.
+- Score normalized to `2 × |close − prior_close| / proxy_atr` — same axis as OR-breakout's `or_range / session_ATR`, which fixed a picker regression where proxy scores were ranked against OR scores on incomparable scales.
+- Config: `use_prior_close_proxy: bool = False`, `pre_or_k: float = 0.5`.
+
+**A/B backtest** (2025-12-01 → 2026-02-28, SPY/NVDA/AAPL/JPM):
+
+| metric | Proxy ON | Proxy OFF |
+|---|---|---|
+| trades | 157 | 101 |
+| win rate | 49.0% | 56.4% |
+| profit factor | 1.23 | **1.58** |
+| gross PnL | $1,549.66 | **$1,805.41** |
+| max drawdown | -0.28% | -0.22% |
+
+Proxy fires more trades (125 in the 09:30-10:00 window, ~80% of total) but earns less per trade. Default flipped to **off** based on this evidence; feature ships as opt-in. If the user wants to revisit, try a higher `pre_or_k` (e.g. 1.5 or 2.0) on a different universe.
+
+Tests: 4 proxy tests in `test_orb.py`. `test_min_range_filter_uses_session_scale_atr` was updated to explicitly pass `use_prior_close_proxy=False` so the OR-only behavior it tests stays isolated.
+
+#### 2. Pullback warmup pre-loaded from prior session
+
+Today the pullback strategy can't fire before ~12:50 ET because EMA-slow=200 needs 200 minutes of warmup. To enable 09:30 entries we pre-load with prior-session bars at session start. CLAUDE.md's "pure functions in `strategy/`" rule means the strategy can't do I/O itself — the runner pre-fetches and injects.
+
+Built:
+- `src/trading_bot/data/sessions.py` (NEW): `load_prior_session_bars(symbol, today, min_bars=200)` walks the per-UTC-date parquet cache backwards from `today - 1 day`, accumulating sessions until `min_bars` rows or the 10-calendar-day cap. Read-only, never raises, returns empty frame on cache miss. Re-exported from `trading_bot.data`.
+- `PullbackStrategy.set_prior_session_bars(by_symbol: Mapping[str, pd.DataFrame])` setter; internal `dict[str, pd.DataFrame]` state.
+- `_scan_session` now takes `entry_date` and gates entries/flats by that date — pre-loaded bars feed the EMA recursion but are NOT eligible to produce signals (date safety gate).
+- `_prepend_prior` helper concatenates prior bars per-session, sort + drop-duplicate-index.
+- `PullbackConfig.warmup_from_prior_session: bool = True`.
+- `scripts/run_paper.py:261-275` builds the per-symbol prior-bars dict at startup and calls the setter; gated on the config flag.
+
+Tests: 4 in `tests/test_strategy/pullback/test_pullback.py` covering entry-at-09:30 with warmup, prior-bars-never-emit-entries (date gate), fallback-to-today-only when no prior data, and flag-disabled-no-op.
+
+#### 4. Dynamic trailing stop (fixed-dollar ratchet, broker-side stop kept in sync)
+
+The big one. User example: buy at $100 with stop $80; if price rises to $105, stop ratchets to $85 (`offset = entry - initial_stop = $20`; new stop = `max(prior_stop, highest_price - offset)`).
+
+New files:
+- `src/trading_bot/risk/trailing.py` — pure math: `trail_offset`, `ratchet_long_stop`, `ratchet_short_stop`, `ratchet_stop` (dispatcher). Re-exported from `risk/__init__.py`.
+- `.claude/agents/broker-integration.md` — new specialist agent definition created during this work item (user explicitly authorized). **The Claude Code harness only loads agent definitions at session start, so this agent is available NEXT session, not the one it was created in.** Work item 4's broker integration was therefore done directly by Claude instead of via the new specialist.
+
+Protocol + Alpaca adapter:
+- `BrokerClient.replace_stop_price(symbol, new_stop_price) -> bool` added to `execution/broker.py`.
+- `AlpacaPaperBroker.replace_stop_price` (`execution/alpaca_paper.py`) — uses Alpaca's native `replace_order_by_id` (PATCH endpoint) so the position is **never briefly unprotected** by a cancel+place race. Quantizes via existing `_quantize_to_tick`. Idempotent no-op when existing == new. Returns `False` (no raise) when no stop leg found. Explicit family set `{"stop", "stop_loss", "stop_limit"}` for leg detection — deliberately excludes `"trailing_stop"` so a broker-side trailing leg cannot be silently overwritten by this bot-side ratchet.
+
+Session integration (`execution/session.py`):
+- `SessionConfig.trailing_stop_policy: Mapping[str, bool]` (default empty dict). `SessionState.trailing_stop_policy` mirror populated at session start in `run_session`.
+- `_record_entry` stamps `trail_enabled`, `trail_offset`, `trail_extreme` on `open_entries[symbol]` when the producing strategy's policy allows AND `order.stop_price is not None`.
+- `_check_stops_and_takes` ratchets BEFORE the trigger check: updates `trail_extreme` to max/min of latest price, calls `ratchet_stop`, on tightening calls `broker.replace_stop_price` and on success updates the local `stop_price` + emits a TRAIL event line via `render_trade_event` + structured `logger.info("trailing stop ratcheted")`. Auth/validation errors propagate (halt-class); transient `BrokerError` is logged and absorbed, prior stop preserved.
+
+Per-strategy gate (each strategy's config now carries `enable_trailing_stop`):
+- ORB: `True` (intraday momentum, ratcheting locks in gains as the breakout extends).
+- Pullback: `True` (same rationale).
+- Insider: `False` — multi-day swing with a deliberately wide 2.5×ATR stop; ratcheting would knock the position out during normal multi-day drawdowns the wide stop was sized to absorb.
+
+`scripts/run_paper.py` builds the per-strategy `trailing_stop_policy` dict from each strategy's config at startup and passes to SessionConfig.
+
+Backtest engine (`backtest/engine.py`) extended: new `trailing_stop_policy` parameter, parallel `open_trail_enabled` / `open_trail_offset` / `open_trail_extreme` state, ratchet applied per-bar against `bar_high` (long) / `bar_low` (short) as worst-case-within-bar extremes. Default `None` keeps existing backtest tests byte-identical. `scripts/compare_trailing.py` (new) is the A/B harness.
+
+Risk-officer reviewed and approved with notes; notes addressed before tester ran (most notably the stop-leg detection was tightened from `startswith("stop")` to the explicit family set, so `"trailing_stop"` is correctly excluded).
+
+Tests:
+- `tests/test_risk/test_trailing.py` (NEW) — 20 tests for ratchet monotonicity (long/short), offset sign, no-op-on-equality, no-op-on-first-poll safety invariant, dispatcher.
+- `tests/test_execution/test_alpaca_paper.py` — 16 new `replace_stop_price` cases including the family-detection parametrize (asserts `"trailing_stop"` is NOT picked up).
+- `tests/test_execution/test_session_trailing.py` (NEW) — 15 session-level tests including the per-strategy gate (insider stays static even when policy contains it as `False`).
+
+**A/B backtest** (same window as #3, trailing ON vs OFF):
+
+| metric | Trail ON | Trail OFF |
+|---|---|---|
+| trades | 151 | 151 |
+| win rate | 49.7% | 51.7% |
+| profit factor | 1.55 | 1.54 |
+| gross PnL | $1,776.03 | $1,805.99 |
+| max drawdown | -0.22% | -0.22% |
+| avg win | $66.59 | $65.69 |
+| avg loss | -$42.34 | -$45.45 |
+
+Trade counts identical (151/151) — the trail only tightened exit prices, didn't create new stop-outs. Aggregate: roughly a wash. Avg loss decreased modestly, avg win also decreased, gross PnL down $30. JPM was the one symbol where trailing meaningfully reduced the loss. Historical only — no forward-looking claim.
+
+### Capital cap (`max_capital_usd`) — added after the 5-item plan
+
+User asked for a hard cap because they're a student with at most ~3000 DKK to invest if this ever goes live.
+
+- `RiskParams.max_capital_usd: Decimal | None = None` field (`contracts.py:62-69`).
+- `effective_equity(equity, params)` helper in `risk/sizing.py`, re-exported from `trading_bot.risk`. Returns `min(equity, max_capital_usd)` when set, raw equity when not.
+- `size_position`, `check_daily_loss`, and `validate_order` all route through `effective_equity` for their percentage-of-equity calculations.
+- **Intentionally NOT capped:** `realized_pnl_today` in `session.py` — that's a real P&L delta; capping it would silently mask drawdowns. The risk-officer specifically asked this be documented; it now is in `kill_switch.py`.
+- CLI: `--max-capital-usd` flag on `scripts/run_paper.py`. Help text notes the DKK→USD conversion (`3000 DKK ≈ $435 USD at ~6.9 DKK/USD`). Backtest scripts already build `RiskParams` directly, so the cap flows through without harness changes.
+- Tests: 10 new across `test_sizing.py`, `test_kill_switch.py`, `test_validation.py`. Risk-officer approved with notes; all notes addressed.
+
+### The actual problem now: $435 USD is too small for the current strategy defaults
+
+Smoke-tested the cap end-to-end with `max_capital_usd=$435`. At that bankroll:
+
+- `max_pct_per_trade=2%` → per-trade notional cap is **$8.70**.
+- Most US equities in the bot's universe trade above $8.70/share, so `size_position` rounds qty down to **0 shares** for any reasonable entry. The bot would fire essentially no trades.
+- `max_daily_loss_pct=3%` → daily-loss kill switch trips at **−$13.05** realized.
+
+The current strategy defaults were tuned for ~$100k paper equity. At $435 the bot is functionally inert.
+
+To make a $435 deployment meaningful the user needs **one or more of**:
+
+1. **Cheaper symbols (under ~$10/share).** Current universe excludes most of these. The insider-track regional banks (CBC, WSBC, GABC, SFNC, FMBM, BWFG, CIVB) sit roughly in $20-$100; closer to viable but still won't fit at 2%-per-trade off $435.
+2. **Higher `max_pct_per_trade`** (currently 2%; e.g. 10-25%) so a single trade can use a larger fraction of the tiny bankroll. **This is a real risk-profile change — backtest before flipping. A 25% per-trade allocation means one bad trade can knock 25% off the equity, which interacts with the daily-loss cap.**
+3. **Higher `target_size_pct` per strategy** (currently 10% for ORB/pullback, 10% for insider). Less load-bearing than `max_pct_per_trade` here since the latter is the binding constraint.
+4. **More capital before going live.** The realistic floor for the current strategy defaults is probably $5k–$10k USD; below that, per-trade sizing squeezes to zero on most symbols.
+
+**Recommended diagnostic next session:** run a backtest with `max_capital_usd=$435` over the same Dec 2025 - Feb 2026 window and see how many trades actually fire and what the hypothetical PnL is. If it's ~zero trades, the user has a real architectural choice to make (raise `max_pct_per_trade`, narrow universe to cheap names, wait for more capital, or accept paper-only learning).
+
+### Carry-forwards from this session
+
+- **Pre-existing audit-log flake** (`test_filter_audit_log_emits_or_atr_and_cold_start`) is still the only failing test in the suite. Same shape as in the prior handover (test caplog asks for INFO, the strategy emits at DEBUG). Out of scope for the 5-item plan; not addressed this session. **Recommend picking it up as a small follow-up** — strategist would need ~15 minutes.
+- **`broker-integration` agent** is on disk at `.claude/agents/broker-integration.md` but only loads on the next Claude Code restart. Future broker work (e.g. order-replace for take-profit legs, IBKR adapter, etc.) should use it then.
+- **User memory updates this session:**
+  - `feedback_new_function_workflow` — required 4-step process for every new function: subagent → reuse existing code → strip dead code → short comment.
+  - `feedback_git_push_allowed` — push permitted only to `https://github.com/MrSvarer69/StockBot.git`; always confirm per-action.
+  - `feedback_always_ask_before_changes` — per-action confirmation even when the user has previously granted broad authorization.
+- **CLAUDE.md hard rule #5 updated by the user** to allow commits/pushes with confirmation (was previously "NO git commit or git push"). The HTTPS URL above is the only push target since the machine isn't logged into git.
+
+### Suggested first move next session
+
+> "Decide on the $435 deployment shape: (a) raise `max_pct_per_trade` to fit the small bankroll (and re-validate via backtest), (b) restrict the universe to cheap symbols, (c) wait for more capital before going live, or (d) accept the bot fires ~zero trades at this scale and use it purely for paper-only learning. Then either re-run the backtest with the chosen knobs or pick the audit-log flake as a small follow-up."
+
+### Hard rules still in force (from CLAUDE.md, unchanged shape)
+
+- Paper-only default.
+- No forecasts in outputs (backtest results from real history are fine).
+- Pure functions in `strategy/` — pullback's prior-bar state is set externally by the runner, preserving this rule.
+- Every order placement goes through `trading_bot.risk` for sizing / validation; risk-officer reviews any `execution/` or `risk/` change. The new `effective_equity` and `ratchet_stop` helpers both live in `risk/` and are re-exported from the package.
+- Bracket contract: every entry signal carries `stop_price` and `take_price`.
+- Git: rule #5 now permits commits/pushes with explicit per-action operator confirmation; remote is HTTPS-only at `https://github.com/MrSvarer69/StockBot.git`. Claude does NOT push without asking.
+
+---
+
 ## Where we left off (2026-05-20, late evening — insider live-refresh wired; user has set the target architecture as THREE separate bots)
 
 This session diagnosed why today's paper-trading run did not place any trades, and built live-refresh for the insider data path so the same failure won't happen again. The user then declared the architectural target they want: **three separate, independently runnable bots — ORB, Insider, and a Midday trader.** The Midday trader does not exist yet and is the main outstanding build.

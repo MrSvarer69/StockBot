@@ -35,6 +35,21 @@ class ORBConfig:
     # Latest ET time at which a NEW entry may be opened. Flat signals are not
     # gated. None disables the filter entirely.
     latest_entry_et: str | None = None
+    # Pre-OR proxy entry: before the opening range completes at 10:00 ET, allow
+    # entries off a band built from prior_close ± pre_or_k * prior_session_ATR.
+    # Keeps the strategy tradeable during 09:30–10:00 instead of always waiting.
+    # Defaults OFF — historical backtest on SPY/NVDA/AAPL/JPM (2025-12-01 to
+    # 2026-02-28) showed the proxy hurt risk-adjusted metrics vs OR-only.
+    use_prior_close_proxy: bool = False
+    # ATR multiplier on the proxy band. k=0.5 is loose enough to fire on a
+    # meaningful gap-and-go move but tight enough to avoid bar-level noise on
+    # quiet opens. Tuned together with min_range_atr_multiplier (also 0.5).
+    pre_or_k: float = 0.5
+    # Per-position trailing stop policy declared to the session loop. The
+    # strategy itself does not implement the ratchet; this flag tells the
+    # session layer whether to apply one. ORB defaults True (intraday
+    # momentum benefits from locking in gains as the breakout extends).
+    enable_trailing_stop: bool = True
 
     @staticmethod
     def _parse_time(s: str) -> dtime:
@@ -128,6 +143,11 @@ class ORBStrategy:
         rows: list[dict] = []
         cfg = self.config
         prior_session_ranges: deque[float] = deque(maxlen=cfg.atr_period_sessions)
+        # Parallel deque holding the closing price of each completed prior
+        # session. Kept in lockstep with prior_session_ranges (one entry per
+        # session, appended at the same point) so the most recent close
+        # is always prior_session_closes[-1]. Used by the pre-OR proxy band.
+        prior_session_closes: deque[float] = deque(maxlen=cfg.atr_period_sessions)
 
         for session_date in session_dates:
             mask = pd.Series(et_index.date, index=bars.index).values == session_date
@@ -163,7 +183,69 @@ class ORBStrategy:
                     },
                 )
                 prior_session_ranges.append(_session_range(session))
+                prior_session_closes.append(float(session["close"].iloc[-1]))
                 continue
+
+            # Single-trade-per-side gate; shared by the proxy phase (below) and
+            # the OR-breakout phase. The proxy may set these BEFORE the OR
+            # filter runs, which is intentional — a proxy fire pre-empts the
+            # OR breakout for the same symbol/session.
+            long_done = False
+            short_done = False
+
+            # Pre-OR proxy band: before the OR completes, fire on a close that
+            # breaks prior_close ± pre_or_k * prior_session_ATR. Stop/take use
+            # the same ATR-based formulae as the OR-breakout phase, with
+            # `proxy_atr` being the prior-session ATR (causal at 09:30). Runs
+            # BEFORE the OR filter because proxy fires are independent of the
+            # not-yet-complete OR range. latest_entry_time would gate here too,
+            # but the proxy window (09:30–10:00) is strictly earlier than the
+            # default 12:00 cutoff; documented for completeness.
+            if (
+                cfg.use_prior_close_proxy
+                and len(prior_session_closes) > 0
+                and len(prior_session_ranges) > 0
+            ):
+                proxy_atr = _session_atr(prior_session_ranges)
+                prior_close = prior_session_closes[-1]
+                if proxy_atr > 0 and prior_close > 0:
+                    upper_edge = prior_close + cfg.pre_or_k * proxy_atr
+                    lower_edge = prior_close - cfg.pre_or_k * proxy_atr
+                    for ts, prow in or_window.iterrows():
+                        close = float(prow["close"])
+                        # Score on the same axis as the OR-breakout path
+                        # (or_range / session_ATR). The proxy band is symmetric
+                        # around prior_close, so its "implied breakout range" is
+                        # 2 * |close - prior_close|; dividing by proxy_atr puts
+                        # it on the OR-breakout scale. At the firing threshold
+                        # (k=0.5) this equals 1.0, comparable to the OR ratio.
+                        proxy_score = 2.0 * abs(close - prior_close) / proxy_atr
+                        if not long_done and close > upper_edge:
+                            stop = close - cfg.atr_stop_multiplier * proxy_atr
+                            take = close + cfg.take_r_multiple * (close - stop)
+                            rows.append(
+                                self._row(
+                                    ts, symbol, "long", stop=stop, take=take,
+                                    or_atr_ratio=proxy_score,
+                                )
+                            )
+                            long_done = True
+                        elif (
+                            cfg.allow_short
+                            and not short_done
+                            and close < lower_edge
+                        ):
+                            stop = close + cfg.atr_stop_multiplier * proxy_atr
+                            take = close - cfg.take_r_multiple * (stop - close)
+                            rows.append(
+                                self._row(
+                                    ts, symbol, "short", stop=stop, take=take,
+                                    or_atr_ratio=proxy_score,
+                                )
+                            )
+                            short_done = True
+                        if long_done and (short_done or not cfg.allow_short):
+                            break
 
             or_high = float(or_window["high"].max())
             or_low = float(or_window["low"].min())
@@ -210,11 +292,10 @@ class ORBStrategy:
                     },
                 )
                 prior_session_ranges.append(_session_range(session))
+                prior_session_closes.append(float(session["close"].iloc[-1]))
                 rows.extend(self._maybe_flat(after_or, symbol))
                 continue
 
-            long_done = False
-            short_done = False
             latest_entry = cfg.latest_entry_time
             for ts, row in after_or.iterrows():
                 # Late-day entries (ORB historically does poorly on late breakouts)
@@ -253,6 +334,7 @@ class ORBStrategy:
 
             rows.extend(self._maybe_flat(after_or, symbol))
             prior_session_ranges.append(_session_range(session))
+            prior_session_closes.append(float(session["close"].iloc[-1]))
 
         if not rows:
             return empty_signals_frame()
@@ -263,6 +345,7 @@ class ORBStrategy:
                 "timestamp",
                 "symbol",
                 "side",
+                "strategy",
                 "target_size_pct",
                 "stop_price",
                 "take_price",
@@ -307,6 +390,7 @@ class ORBStrategy:
             "timestamp": ts,
             "symbol": symbol,
             "side": side,
+            "strategy": "orb",
             "target_size_pct": float(self.config.target_size_pct),
             "stop_price": stop,
             "take_price": take,

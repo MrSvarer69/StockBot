@@ -216,3 +216,64 @@ def test_daily_notional_uses_limit_price_when_market_price_absent(tmp_path):
     )
     assert not decision.approved
     assert "daily notional cap" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# max_capital_usd tightens the daily-notional cap inside validate_order.
+# ---------------------------------------------------------------------------
+
+
+def test_daily_notional_cap_uncapped_allows_order(tmp_path):
+    # No max_capital_usd; daily cap = 0.50 * 10000 = $5000. A $250 order fits.
+    params = _params(
+        max_daily_notional_pct=Decimal("0.50"),
+        max_capital_usd=None,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    state = _state(cumulative_notional_today=Decimal("0"))
+    decision = validate_order(
+        _order(qty=Decimal("25")),
+        state,
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),
+    )
+    assert decision.approved
+
+
+def test_daily_notional_cap_capped_fits_exactly(tmp_path):
+    # max_capital_usd=$500 -> daily cap = 0.50 * 500 = $250.
+    # A single $250 order should fit exactly (boundary is `>`).
+    params = _params(
+        max_daily_notional_pct=Decimal("0.50"),
+        max_capital_usd=Decimal("500"),
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    state = _state(cumulative_notional_today=Decimal("0"))
+    decision = validate_order(
+        _order(qty=Decimal("25")),
+        state,
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),
+    )
+    assert decision.approved
+
+
+def test_daily_notional_cap_capped_rejects_over_threshold(tmp_path):
+    # Same cap as above; a $251 order spills past the $250 capped ceiling.
+    params = _params(
+        max_daily_notional_pct=Decimal("0.50"),
+        max_capital_usd=Decimal("500"),
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    state = _state(cumulative_notional_today=Decimal("0"))
+    decision = validate_order(
+        _order(qty=Decimal("251")),
+        state,
+        params,
+        market_is_open=True,
+        current_price=Decimal("1"),
+    )
+    assert not decision.approved
+    assert "daily notional cap hit" in decision.reason

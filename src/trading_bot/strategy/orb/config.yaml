@@ -22,3 +22,29 @@ target_size_pct: 0.10
 # of low-conviction days without nuking the universe.
 min_range_atr_multiplier: 0.5
 allow_short: true
+# Pre-OR proxy band — makes ORB tradeable during the 09:30–10:00 ET window
+# instead of always waiting for the opening range to complete. Until 10:00 ET
+# the strategy uses a proxy range built from the prior session:
+#   upper_edge = prior_close + pre_or_k * prior_session_ATR
+#   lower_edge = prior_close - pre_or_k * prior_session_ATR
+# A bar that closes outside the band fires a long/short entry with the same
+# ATR-based stop/take as the OR-breakout phase. After 10:00 the regular OR
+# logic takes over unchanged. pre_or_k=0.5 is loose enough to fire on a
+# meaningful gap-and-go move but tight enough to avoid bar-level noise on
+# quiet opens; deliberately matched to min_range_atr_multiplier.
+#
+# Default is OFF pending a configuration / window where the proxy improves
+# edge. Backtest on SPY/NVDA/AAPL/JPM (2025-12-01 to 2026-02-28) showed
+# proxy-enabled profit factor 1.23 vs OR-only 1.58. Feature ships as an
+# opt-in flag for further investigation.
+use_prior_close_proxy: false
+pre_or_k: 0.5
+
+# Per-position trailing stop ratchet (owned by the session loop, not the
+# strategy's generate_signals). When true, the session layer ratchets the
+# stop upward as price moves favourably, locking in gains as the breakout
+# extends. ORB defaults ON: it is an intraday momentum trade where the
+# follow-through compounds within the session, and giving back accrued
+# profit to the original ATR stop on a late-session reversal is the most
+# common loss pattern.
+enable_trailing_stop: true

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from trading_bot.risk import RiskParams, size_position
+import pytest
+
+from trading_bot.risk import RiskParams, effective_equity, size_position
 
 
 def _params(**kw) -> RiskParams:
@@ -122,3 +124,111 @@ def test_qty_is_decimal_whole_shares():
     )
     assert isinstance(qty, Decimal)
     assert qty == qty.quantize(Decimal("1"))
+
+
+# ---------------------------------------------------------------------------
+# max_capital_usd behavior — sizing must use effective_equity, not raw equity.
+# ---------------------------------------------------------------------------
+
+
+def test_max_capital_cap_binds_when_below_equity():
+    # equity 10k, cap 500 — sizing must act as if bankroll were 500.
+    # target_notional = 500 * 0.10 = 50
+    # cap_notional    = 500 * 0.02 = 10  (binds)
+    # entry=$1, no stop -> qty = 10/1 = 10 shares.
+    # If sizing wrongly used the raw $10k equity, per-trade cap would be
+    # 10000 * 0.02 = 200 -> 200 shares. We pin the cap-honouring path.
+    qty = size_position(
+        equity=Decimal("10000"),
+        target_pct=Decimal("0.10"),
+        entry_price=Decimal("1"),
+        stop_price=None,
+        params=_params(
+            max_pct_per_trade=Decimal("0.02"),
+            max_capital_usd=Decimal("500"),
+        ),
+    )
+    assert qty == Decimal("10")
+
+
+def test_max_capital_cap_loose_uses_raw_equity():
+    # equity 100, cap 500 -> cap is loose; effective_equity = 100.
+    # target_notional = 100 * 0.10 = 10
+    # cap_notional    = 100 * 0.02 = 2  (binds)
+    # entry=$1 -> qty = 2.
+    qty = size_position(
+        equity=Decimal("100"),
+        target_pct=Decimal("0.10"),
+        entry_price=Decimal("1"),
+        stop_price=None,
+        params=_params(
+            max_pct_per_trade=Decimal("0.02"),
+            max_capital_usd=Decimal("500"),
+        ),
+    )
+    assert qty == Decimal("2")
+    # Sanity: same inputs with cap=None must produce the same result —
+    # the cap is genuinely irrelevant here.
+    qty_no_cap = size_position(
+        equity=Decimal("100"),
+        target_pct=Decimal("0.10"),
+        entry_price=Decimal("1"),
+        stop_price=None,
+        params=_params(
+            max_pct_per_trade=Decimal("0.02"),
+            max_capital_usd=None,
+        ),
+    )
+    assert qty_no_cap == qty
+
+
+def test_max_capital_zero_returns_zero_with_warning(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="trading_bot.risk.sizing")
+    qty = size_position(
+        equity=Decimal("10000"),
+        target_pct=Decimal("0.10"),
+        entry_price=Decimal("100"),
+        stop_price=None,
+        params=_params(
+            max_pct_per_trade=Decimal("0.02"),
+            max_capital_usd=Decimal("0"),
+        ),
+    )
+    assert qty == Decimal("0")
+    assert any(
+        "non-positive capped equity" in r.message for r in caplog.records
+    )
+
+
+def test_max_capital_none_matches_pre_cap_baseline():
+    # Baseline: equity 10k, target 10%, per-trade 2%, no stop, no cap.
+    # cap_notional = 10000 * 0.02 = 200 (binds), entry=$100 -> qty = 2.
+    qty = size_position(
+        equity=Decimal("10000"),
+        target_pct=Decimal("0.10"),
+        entry_price=Decimal("100"),
+        stop_price=None,
+        params=_params(
+            max_pct_per_trade=Decimal("0.02"),
+            max_capital_usd=None,
+        ),
+    )
+    assert qty == Decimal("2")
+
+
+@pytest.mark.parametrize(
+    "equity, cap, expected",
+    [
+        (Decimal("10000"), Decimal("500"), Decimal("500")),  # cap binds
+        (Decimal("100"), Decimal("500"), Decimal("100")),  # equity binds
+        (Decimal("500"), Decimal("500"), Decimal("500")),  # tie -> cap value
+        (Decimal("10000"), None, Decimal("10000")),  # no cap -> raw
+        (Decimal("0"), Decimal("500"), Decimal("0")),  # zero equity
+        (Decimal("10000"), Decimal("0"), Decimal("0")),  # zero cap
+    ],
+)
+def test_effective_equity_returns_min_of_equity_and_cap(equity, cap, expected):
+    params = _params(max_capital_usd=cap)
+    assert effective_equity(equity, params) == expected

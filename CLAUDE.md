@@ -16,8 +16,9 @@ Claude agents and skills. Engineering quality matters more than alpha.
 4. **Risk boundary is non-optional.** Every order placement path must go through
    `trading_bot.risk` for sizing and sanity checks. No direct calls to the broker client
    from strategy code.
-5. **Git handling.** ALL git handling will be handled by me. Meaning NO git commit
-   or git push.
+5. **Git handling.**  With every git commit or push ask the user, even if 'make all changes'
+   is allowed. The git directory is only available through HTTPS, which is the following: 
+   'https://github.com/MrSvarer69/StockBot.git'.
 
 ## Layout
 

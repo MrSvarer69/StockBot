@@ -286,6 +286,130 @@ def test_flat_signal_emitted_at_holding_horizon(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Flat horizon — bars-window coverage regressions
+# ---------------------------------------------------------------------------
+# Why: `_resolve_flat_timestamp` used to clamp its target date to the last
+# loaded bar when bars didn't extend `holding_days + 1` trading days past
+# the entry — which caused same-day flats in live sessions where the bars
+# window only spans the current session. The clamp has been removed:
+#
+#   * If bars cover fewer than holding_days + 1 trading days from entry,
+#     no flat row is emitted (the position carries; the broker bracket is
+#     the overnight safety net).
+#   * If bars cover at least holding_days + 1 trading days, the flat lands
+#     on the last bar of the holding_days-th day after entry — never on the
+#     last bar of the dataframe just because that bar happens to exist.
+#
+# These three cases pin that contract so a future regression cannot
+# silently reintroduce the same-day flatten.
+
+
+@pytest.mark.parametrize(
+    "case_id, session_dates, expect_flat, expected_flat_date",
+    [
+        # Carry-over: only the entry day is loaded; holding_days=2 means we
+        # need entry + 2 more trading days. No flat should be emitted.
+        (
+            "carry_over_entry_day_only",
+            [date(2026, 3, 10)],
+            False,
+            None,
+        ),
+        # Carry-over: entry + 1 trading day, still short of holding_days=2.
+        (
+            "carry_over_partial_window",
+            [date(2026, 3, 10), date(2026, 3, 11)],
+            False,
+            None,
+        ),
+        # Exact fit: holding_days + 1 trading days starting from entry.
+        # Flat lands on the holding_days-th day (2026-03-12).
+        (
+            "exact_fit",
+            [date(2026, 3, 10), date(2026, 3, 11), date(2026, 3, 12)],
+            True,
+            date(2026, 3, 12),
+        ),
+        # Over-fit: bars extend well beyond holding_days. Flat must still
+        # land on the holding_days-th day after entry, NOT on the last bar
+        # of the dataframe.
+        (
+            "over_fit_long_window",
+            [
+                date(2026, 3, 10),
+                date(2026, 3, 11),
+                date(2026, 3, 12),
+                date(2026, 3, 13),
+                date(2026, 3, 16),  # weekend skip -> Monday
+            ],
+            True,
+            date(2026, 3, 12),
+        ),
+    ],
+)
+def test_flat_horizon_respects_bars_window_coverage(
+    tmp_path: Path,
+    case_id: str,
+    session_dates: list[date],
+    expect_flat: bool,
+    expected_flat_date: date | None,
+) -> None:
+    """Pin the carry/exact-fit/over-fit contract of `_resolve_flat_timestamp`.
+
+    With holding_days=2 and entry on 2026-03-10:
+      - bars covering <3 trading days from entry  -> no flat (carry-over)
+      - bars covering exactly 3 trading days      -> flat on day +2
+      - bars covering >3 trading days             -> still flat on day +2
+    """
+    filings = _make_cluster_for_ticker(
+        "ACME",
+        base_txn_date=date(2026, 3, 4),
+        max_filing_date=date(2026, 3, 9),  # Mon -> entry on Tue 2026-03-10
+    )
+    _write_parquet_fixture(tmp_path, filings)
+
+    cfg = _build_config(tmp_path, holding_days=2)
+    strat = InsiderStrategy(cfg)
+    bars = _make_bars(symbols=["ACME"], session_dates=session_dates)
+
+    signals = strat.generate_signals(bars)
+
+    # Entry should always fire on 2026-03-10 since that day is in every
+    # parametrize variant — guards the test setup itself.
+    entries = signals[signals["side"] == "long"]
+    assert len(entries) == 1, (
+        f"[{case_id}] expected exactly one entry; got: {signals}"
+    )
+    assert entries.iloc[0]["timestamp"].tz_convert(ET).date() == date(2026, 3, 10)
+
+    flats = signals[signals["side"] == "flat"]
+    if not expect_flat:
+        assert flats.empty, (
+            f"[{case_id}] expected no flat (bars window too short for "
+            f"holding_days={cfg.holding_days}); got: {flats}"
+        )
+        return
+
+    assert len(flats) == 1, (
+        f"[{case_id}] expected exactly one flat; got: {flats}"
+    )
+    flat_et = flats.iloc[0]["timestamp"].tz_convert(ET)
+    assert flat_et.date() == expected_flat_date, (
+        f"[{case_id}] flat must land on the holding_days-th day after "
+        f"entry, not on the last bar of the dataframe"
+    )
+    # And it must be the LAST bar of that target date — _resolve_flat_timestamp
+    # picks `target_bars.index[-1]`.
+    same_day_bars = bars[
+        (bars["symbol"] == "ACME")
+        & (bars.index.tz_convert(ET).date == expected_flat_date)
+    ]
+    assert flats.iloc[0]["timestamp"] == same_day_bars.index[-1], (
+        f"[{case_id}] flat must anchor to the last bar of {expected_flat_date}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Multi-symbol isolation
 # ---------------------------------------------------------------------------
 
