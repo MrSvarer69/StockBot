@@ -1,5 +1,10 @@
 session_start_et: "09:30"
 session_end_et: "16:00"
+# Time-of-day forced flat (ET). Default "15:55" liquidates before the close.
+# A null value disables the flat (hold overnight) — but this is NOT YET SAFE:
+# broker-side overnight protection (GTC stop/take) is not implemented, so a
+# held position would be unprotected once the DAY bracket expires at the close.
+# Keep "15:55" until that protection lands.
 flat_by_et: "15:55"
 # Open-to-close window. The 200-EMA warmup means the earliest *effective*
 # entry is around 12:50 ET (09:30 + 200 1-min bars), so values lower than
@@ -66,8 +71,9 @@ warmup_from_prior_session: true
 
 # Per-position trailing stop ratchet (owned by the session loop, not the
 # strategy's generate_signals). When true, the session layer ratchets the
-# stop in the direction of profit. Pullback defaults ON for the same reason
-# as ORB: it is a daytrade with intraday compounding, and the bracket order
-# flat by 15:55 means the strategy has no overnight risk to budget for --
-# protecting accrued profit through the afternoon is the dominant concern.
+# stop in the direction of profit. Pullback defaults ON: it is a daytrade
+# with intraday compounding, so protecting accrued profit through the
+# afternoon is the dominant concern. NOTE: the ratchet only runs while the
+# bot is live; for an overnight-held position (flat_by_et: null) the stop is
+# frozen at its last in-session value until the next morning.
 enable_trailing_stop: true

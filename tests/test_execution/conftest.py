@@ -29,7 +29,13 @@ def _isolated_ops_dirs(tmp_path, monkeypatch):
         "_DEFAULT_UNRECONCILED_DIR",
         tmp_path / "unreconciled",
     )
+    monkeypatch.setattr(
+        session_module,
+        "_DEFAULT_CARRIED_DIR",
+        tmp_path / "carried",
+    )
     yield {
         "session_state": tmp_path / "session_state",
         "unreconciled": tmp_path / "unreconciled",
+        "carried": tmp_path / "carried",
     }

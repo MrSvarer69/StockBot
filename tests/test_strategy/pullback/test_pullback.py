@@ -138,6 +138,19 @@ def test_flat_signal_emitted_at_session_end():
     assert ts_et.time() >= pd.Timestamp("15:55").time()
 
 
+def test_flat_by_et_none_holds_overnight_no_flat_signal():
+    """flat_by_et=None disables the EOD flat so the position is held overnight.
+    The default config still flattens — this is the opt-out path."""
+    bars = make_session(date(2026, 5, 5), phase="trend_up_pullback_reclaim")
+    held = PullbackStrategy(_cfg(flat_by_et=None)).generate_signals(bars)
+    assert held[held["side"] == "flat"].empty
+    # Entries are unaffected by disabling the flat.
+    default = PullbackStrategy(_cfg()).generate_signals(bars)
+    held_entries = held[held["side"].isin(["long", "short"])]
+    default_entries = default[default["side"].isin(["long", "short"])]
+    assert len(held_entries) == len(default_entries)
+
+
 def test_cooldown_throttles_back_to_back_entries():
     bars = make_session(
         date(2026, 5, 5),

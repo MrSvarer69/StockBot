@@ -1,6 +1,11 @@
 opening_range_minutes: 30
 session_start_et: "09:30"
 session_end_et: "16:00"
+# Time-of-day forced flat (ET). Default "15:55" liquidates before the close.
+# A null value disables the flat (hold overnight) — but this is NOT YET SAFE:
+# broker-side overnight protection (GTC stop/take) is not implemented, so a
+# held position would be unprotected once the DAY bracket expires at the close.
+# Keep "15:55" until that protection lands.
 flat_by_et: "15:55"
 # Suppress new entries at or after this time (ET) — the bound is exclusive,
 # so a bar timestamped exactly 12:00:00 is rejected. ORB historically does

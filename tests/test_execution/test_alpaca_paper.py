@@ -120,6 +120,42 @@ def test_submit_order_quantizes_bracket_prices_against_regression() -> None:
     assert req.take_profit.limit_price == 744.35
 
 
+def test_submit_order_defaults_to_day_tif() -> None:
+    """Default time_in_force maps to DAY (bracket expires at the close)."""
+    broker = AlpacaPaperBroker(api_key="dummy", api_secret="dummy")
+    fake_client = _fake_trading_client_response("CRWD")
+    broker._trading = fake_client  # type: ignore[assignment]
+
+    broker.submit_order(_make_bracket_order(stop=Decimal("90"), take=Decimal("110")))
+    req = fake_client.submit_order.call_args.args[0]
+    assert str(req.time_in_force).endswith("DAY")
+
+
+def test_submit_order_gtc_tif_for_overnight_bracket() -> None:
+    """time_in_force='gtc' maps to GTC so the bracket survives overnight.
+
+    NOTE: whether Alpaca accepts GTC on a market-parent bracket must be
+    confirmed on live paper before enabling protect_overnight (plan Phase 2).
+    """
+    broker = AlpacaPaperBroker(api_key="dummy", api_secret="dummy")
+    fake_client = _fake_trading_client_response("CRWD")
+    broker._trading = fake_client  # type: ignore[assignment]
+
+    order = ProposedOrder(
+        symbol="CRWD",
+        side=OrderSide.BUY,
+        qty=Decimal("2"),
+        order_type=OrderType.MARKET,
+        stop_price=Decimal("90"),
+        take_price=Decimal("110"),
+        client_order_id="test-CRWD",
+        time_in_force="gtc",
+    )
+    broker.submit_order(order)
+    req = fake_client.submit_order.call_args.args[0]
+    assert str(req.time_in_force).endswith("GTC")
+
+
 def test_submit_order_quantizes_oto_stop_only() -> None:
     broker = AlpacaPaperBroker(api_key="dummy", api_secret="dummy")
     fake_client = _fake_trading_client_response("AAPL")

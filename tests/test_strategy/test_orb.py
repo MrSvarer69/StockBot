@@ -28,6 +28,19 @@ def test_up_breakout_produces_one_long_entry():
     assert entry["take_price"] > bars.loc[entry["timestamp"], "close"]
 
 
+def test_flat_by_et_none_holds_overnight_no_flat_signal():
+    """flat_by_et=None disables the EOD flat (hold overnight) without affecting
+    the entry. The default config keeps the flat — this is the opt-out path."""
+    bars = make_synthetic_session(date(2026, 1, 5), breakout="up")
+
+    held = ORBStrategy(_cfg(flat_by_et=None)).generate_signals(bars)
+    assert held[held["side"] == "flat"].empty
+    # Entry is unchanged vs the flat-enabled default.
+    default = ORBStrategy(_cfg()).generate_signals(bars)
+    assert len(held[held["side"] == "long"]) == len(default[default["side"] == "long"]) == 1
+    assert not default[default["side"] == "flat"].empty  # default still flattens
+
+
 def test_down_breakout_produces_one_short_entry():
     bars = make_synthetic_session(date(2026, 1, 5), breakout="down")
     strat = ORBStrategy(_cfg(allow_short=True))

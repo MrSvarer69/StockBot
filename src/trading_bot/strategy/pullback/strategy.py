@@ -80,7 +80,11 @@ _DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 class PullbackConfig:
     session_start_et: str
     session_end_et: str
-    flat_by_et: str
+    # Time-of-day forced flat ("HH:MM" ET). Required key. null/empty disables
+    # the end-of-day flat (hold overnight) — NOT yet safe to use: broker-side
+    # overnight protection (GTC stop/take) is not implemented, so a held
+    # position is unprotected once the DAY bracket expires at the close.
+    flat_by_et: str | None
     earliest_entry_et: str
     latest_entry_et: str
     ema_fast_period: int
@@ -123,7 +127,10 @@ class PullbackConfig:
         return self._parse_time(self.session_end_et)
 
     @property
-    def flat_time(self) -> dtime:
+    def flat_time(self) -> dtime | None:
+        """Parsed flat time, or None when the EOD flat is disabled (hold overnight)."""
+        if not self.flat_by_et:
+            return None
         return self._parse_time(self.flat_by_et)
 
     @property
@@ -388,23 +395,26 @@ class PullbackStrategy:
 
         # Per-session flat at first bar at/after flat_by_et so any open
         # entry is closed before the close. Restrict to entry_date so a
-        # prepended prior session does not fire the flat twice.
-        if entry_date is not None:
-            flat_mask = np.array(
-                [t >= flat_time and d == entry_date
-                 for t, d in zip(et_times, et_bar_dates)]
-            )
-        else:
-            flat_mask = np.array([t >= flat_time for t in et_times])
-        if flat_mask.any():
-            first_flat = int(np.argmax(flat_mask))
-            rows.append(
-                self._row(
-                    idx[first_flat], symbol, "flat",
-                    stop=float("nan"), take=float("nan"),
-                    score=float("nan"),
+        # prepended prior session does not fire the flat twice. When flat_time
+        # is None the EOD flat is disabled — hold overnight (broker GTC bracket
+        # protects the carried position).
+        if flat_time is not None:
+            if entry_date is not None:
+                flat_mask = np.array(
+                    [t >= flat_time and d == entry_date
+                     for t, d in zip(et_times, et_bar_dates)]
                 )
-            )
+            else:
+                flat_mask = np.array([t >= flat_time for t in et_times])
+            if flat_mask.any():
+                first_flat = int(np.argmax(flat_mask))
+                rows.append(
+                    self._row(
+                        idx[first_flat], symbol, "flat",
+                        stop=float("nan"), take=float("nan"),
+                        score=float("nan"),
+                    )
+                )
         return rows
 
     # ------------------------------------------------------------ pullback

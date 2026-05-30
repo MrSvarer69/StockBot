@@ -25,7 +25,11 @@ class ORBConfig:
     opening_range_minutes: int
     session_start_et: str
     session_end_et: str
-    flat_by_et: str
+    # Time-of-day forced flat ("HH:MM" ET). Required key. null/empty disables
+    # the end-of-day flat (hold overnight) — NOT yet safe to use: broker-side
+    # overnight protection (GTC stop/take) is not implemented, so a held
+    # position is unprotected once the DAY bracket expires at the close.
+    flat_by_et: str | None
     atr_period_sessions: int
     atr_stop_multiplier: float
     take_r_multiple: float
@@ -65,7 +69,10 @@ class ORBConfig:
         return self._parse_time(self.session_end_et)
 
     @property
-    def flat_time(self) -> dtime:
+    def flat_time(self) -> dtime | None:
+        """Parsed flat time, or None when the EOD flat is disabled (hold overnight)."""
+        if not self.flat_by_et:
+            return None
         return self._parse_time(self.flat_by_et)
 
     @property
@@ -364,8 +371,12 @@ class ORBStrategy:
         return dtime(total_minutes // 60, total_minutes % 60)
 
     def _maybe_flat(self, after_or: pd.DataFrame, symbol: str) -> list[dict]:
+        flat_time = self.config.flat_time
+        if flat_time is None:
+            # EOD flat disabled — hold overnight (broker GTC bracket protects it).
+            return []
         et_index = after_or.index.tz_convert(ET)
-        flat_mask = et_index.time >= self.config.flat_time
+        flat_mask = et_index.time >= flat_time
         if not flat_mask.any():
             return []
         first_idx = after_or.index[flat_mask][0]

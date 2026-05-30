@@ -240,6 +240,13 @@ class AlpacaPaperBroker:
         )
 
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
+        # GTC keeps the bracket stop/take alive past the session close so a
+        # position held overnight stays protected; DAY (default) expires them
+        # at 16:00 ET. NOTE: whether Alpaca accepts GTC on a *market*-parent
+        # bracket must be confirmed on live paper — if it is rejected, the
+        # fallback is a post-fill GTC OCO swap (see plan Phase 2). submit_order
+        # raises (loudly, never silently) on a broker rejection.
+        tif = TimeInForce.GTC if order.time_in_force == "gtc" else TimeInForce.DAY
         has_stop = order.stop_price is not None
         has_take = order.take_price is not None
         # Quantize bracket/limit prices to broker tick BEFORE building the
@@ -253,7 +260,7 @@ class AlpacaPaperBroker:
                 symbol=order.symbol,
                 qty=float(order.qty),
                 side=side,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=tif,
                 client_order_id=order.client_order_id,
             )
             # Broker-side safety net: attach stop/take as bracket children so the
@@ -283,7 +290,7 @@ class AlpacaPaperBroker:
                 symbol=order.symbol,
                 qty=float(order.qty),
                 side=side,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=tif,
                 limit_price=float(limit_q),
                 client_order_id=order.client_order_id,
             )
@@ -297,6 +304,7 @@ class AlpacaPaperBroker:
                 "side": order.side.value,
                 "qty": str(order.qty),
                 "type": order.order_type.value,
+                "time_in_force": str(tif),
                 "client_order_id": order.client_order_id,
                 "order_class": bracket_kind,
                 # Log the post-quantization values that actually go on the wire.

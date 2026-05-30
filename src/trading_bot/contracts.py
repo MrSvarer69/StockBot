@@ -97,6 +97,11 @@ class ProposedOrder:
     stop_price: Decimal | None = None
     take_price: Decimal | None = None
     client_order_id: str | None = None
+    # Broker time-in-force: "day" (default; bracket children expire at the
+    # close) or "gtc" (good-till-canceled; bracket stop/take survive overnight
+    # so a held position stays protected). Set "gtc" only when the position is
+    # intended to be carried past the session close.
+    time_in_force: str = "day"
 
 
 @dataclass

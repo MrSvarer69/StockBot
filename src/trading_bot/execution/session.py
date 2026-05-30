@@ -15,8 +15,8 @@ import os
 import signal
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Callable, Iterable
@@ -57,6 +57,17 @@ logger = logging.getLogger(__name__)
 # repo's data/ directory.
 _DEFAULT_SESSION_STATE_DIR = Path("data/ops/session_state")
 _DEFAULT_UNRECONCILED_DIR = Path("data/ops/unreconciled")
+_DEFAULT_CARRIED_DIR = Path("data/ops/carried")
+
+# A carried-position record older than this many calendar days is treated as
+# stale and ignored (positions fall back to the orphan refusal). 4 days covers
+# a Friday-close carry over a long weekend (e.g. holiday Monday) into Tuesday.
+_CARRIED_MAX_AGE_DAYS = 4
+
+# Tolerance on the recorded vs broker avg-entry-price when matching a carried
+# position. Corroboration only — a gross mismatch means a different position
+# and must refuse. Not used to size anything (broker qty is the authority).
+_CARRIED_PRICE_TOLERANCE_PCT = Decimal("0.005")
 
 # Kill-switch poll cadence inside `_sleep_with_safety_checks`. With a 60s
 # poll interval, this caps worst-case kill-file/env detection at ~5s.
@@ -110,9 +121,25 @@ class SessionConfig:
     session_state_dir: Path | None = None
     # Override for the directory holding UNRECONCILED_* sentinel files.
     unreconciled_dir: Path | None = None
+    # Override for the directory holding CARRIED_* overnight-position records.
+    carried_dir: Path | None = None
     # If True, a prior run's unreconciled-positions sentinel does NOT block
     # startup. Operator opt-in only; the default refusal is the safe choice.
     force_ignore_unreconciled: bool = False
+    # Overnight-holding feature gate (default OFF = current behavior). When True:
+    #   1. entries are submitted GTC so the broker-side stop/take bracket
+    #      survives the close and protects a carried position;
+    #   2. on a clean exit that leaves positions open, a CARRIED_<run_id>.json
+    #      record is written;
+    #   3. on startup, broker positions that strictly match a fresh carried
+    #      record are ADOPTED (no force_ignore_unreconciled needed) instead of
+    #      refused. Anything that does not match still hits the orphan refusal.
+    # NOTE: this flag is SESSION-WIDE, not per-strategy. With it on and
+    # flatten_on_exit=False, ANY strategy's open position (including the
+    # intraday orb/pullback bots) can be carried overnight on a clean exit, not
+    # just insider. Enable only after confirming GTC bracket acceptance and
+    # overnight survival on live Alpaca paper.
+    protect_overnight: bool = False
     # Reject signals whose bar timestamp is older than this many minutes vs.
     # the current wall clock. Guards against a late-launched session stuffing
     # the book on hours-old opening-range breakouts (observed 2026-05-14).
@@ -469,6 +496,198 @@ def _write_unreconciled_sentinel(
     return path
 
 
+def _carried_positions_path(config: SessionConfig, run_id: str) -> Path:
+    """Path for this run's carried-position record (never overwrites an older one)."""
+    root = _resolve_dir(config.carried_dir, _DEFAULT_CARRIED_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"CARRIED_{run_id}.json"
+    n = 1
+    while path.exists():
+        path = root / f"CARRIED_{run_id}_{n}.json"
+        n += 1
+    return path
+
+
+def _write_carried_positions(
+    config: SessionConfig,
+    sess: SessionState,
+    broker_positions: dict,
+    now_utc: datetime,
+) -> Path | None:
+    """Record positions intentionally left open on a clean exit so the next
+    start can ADOPT them (Phase 3) instead of hitting the orphan refusal.
+
+    Qty is taken from the broker (authority); the richer entry metadata
+    (stop/take/strategy/trail) comes from ``sess.open_entries`` when present.
+    Stamped with the ET trading date for the startup freshness check.
+    """
+    if not broker_positions:
+        return None
+    et_date = now_utc.astimezone(ZoneInfo("America/New_York")).date()
+    records = []
+    for symbol, bpos in broker_positions.items():
+        entry = sess.open_entries.get(symbol, {})
+        side = entry.get("side") or ("long" if bpos.qty > 0 else "short")
+        entry_price = entry.get("entry_price", bpos.avg_entry_price)
+        records.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "qty": str(abs(bpos.qty)),
+                "entry_price": str(entry_price),
+                "entry_time": (
+                    entry["entry_time"].isoformat()
+                    if entry.get("entry_time") is not None
+                    else pd.Timestamp(now_utc).isoformat()
+                ),
+                "stop_price": str(entry["stop_price"]) if entry.get("stop_price") is not None else None,
+                "take_price": str(entry["take_price"]) if entry.get("take_price") is not None else None,
+                "strategy": entry.get("strategy", ""),
+                "trail_enabled": bool(entry.get("trail_enabled", False)),
+                "trail_offset": str(entry.get("trail_offset", "0")),
+                "trail_extreme": str(entry.get("trail_extreme", entry_price)),
+            }
+        )
+    payload = {
+        "run_id": sess.run_id,
+        "created_at_utc": now_utc.astimezone(UTC).isoformat(),
+        "et_date": et_date.isoformat(),
+        "positions": records,
+    }
+    path = _carried_positions_path(config, sess.run_id or "unknown")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+    except OSError:
+        logger.exception("failed to write carried-position record to %s", path)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return None
+    logger.info(
+        "wrote carried-position record",
+        extra={"path": str(path), "symbols": [r["symbol"] for r in records]},
+    )
+    return path
+
+
+def _load_carried_record(config: SessionConfig, now_utc: datetime) -> dict | None:
+    """Return the newest fresh, well-formed carried-position record, or None.
+
+    None means "no usable record" → the caller falls back to the orphan
+    refusal. A parse failure or a stale (older than `_CARRIED_MAX_AGE_DAYS`)
+    record is treated as no record — never adopted.
+    """
+    root = _resolve_dir(config.carried_dir, _DEFAULT_CARRIED_DIR)
+    if not root.exists():
+        return None
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York")).date()
+    # Newest first: run_id embeds a sortable UTC basic-form timestamp.
+    for path in sorted(root.glob("CARRIED_*.json"), reverse=True):
+        try:
+            data = json.loads(path.read_text())
+            rec_date = date.fromisoformat(data["et_date"])
+        except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
+            logger.warning("ignoring unreadable carried record %s: %s", path, exc)
+            continue
+        age_days = (now_et - rec_date).days
+        if age_days < 0 or age_days > _CARRIED_MAX_AGE_DAYS:
+            logger.warning(
+                "ignoring stale carried record %s (et_date=%s, age=%dd)",
+                path, rec_date, age_days,
+            )
+            continue
+        if not isinstance(data.get("positions"), list):
+            logger.warning("ignoring carried record %s: malformed positions", path)
+            continue
+        return data
+    return None
+
+
+def _adopt_carried_positions(record: dict, broker_positions: dict) -> dict | None:
+    """Strictly match a carried record against live broker positions.
+
+    Returns the open-entries dict to adopt on success, or None to REFUSE.
+    The broker is the source of truth for quantity. Refuses if any broker
+    position is absent from the record, if the broker holds MORE than recorded,
+    or on a side / avg-price mismatch. A recorded position absent at the broker
+    exited overnight — dropped from adoption, not a refusal.
+    """
+    rec_by_sym = {p["symbol"]: p for p in record["positions"]}
+    adopted: dict = {}
+    for symbol, bpos in broker_positions.items():
+        rec = rec_by_sym.get(symbol)
+        if rec is None:
+            logger.error("carried-adopt refuse: broker position %s not in record", symbol)
+            return None
+        try:
+            rec_qty = Decimal(str(rec["qty"]))
+            rec_price = Decimal(str(rec["entry_price"]))
+        except (KeyError, ValueError):
+            logger.error("carried-adopt refuse: malformed record for %s", symbol)
+            return None
+        broker_qty_abs = abs(bpos.qty)
+        if broker_qty_abs > rec_qty:
+            logger.error(
+                "carried-adopt refuse: broker holds MORE than recorded for %s "
+                "(broker=%s recorded=%s)", symbol, broker_qty_abs, rec_qty,
+            )
+            return None
+        broker_side = "long" if bpos.qty > 0 else "short"
+        if broker_side != rec.get("side"):
+            logger.error(
+                "carried-adopt refuse: side mismatch for %s (broker=%s recorded=%s)",
+                symbol, broker_side, rec.get("side"),
+            )
+            return None
+        if rec_price > 0:
+            drift = abs(rec_price - bpos.avg_entry_price) / rec_price
+            if drift > _CARRIED_PRICE_TOLERANCE_PCT:
+                logger.error(
+                    "carried-adopt refuse: avg-price mismatch for %s "
+                    "(broker=%s recorded=%s)", symbol, bpos.avg_entry_price, rec_price,
+                )
+                return None
+        try:
+            adopted[symbol] = {
+                "side": rec["side"],
+                "qty": broker_qty_abs,  # broker is authority (may be < recorded)
+                "entry_price": rec_price,
+                "entry_time": pd.Timestamp(rec["entry_time"]),
+                "stop_price": Decimal(str(rec["stop_price"])) if rec.get("stop_price") else None,
+                "take_price": Decimal(str(rec["take_price"])) if rec.get("take_price") else None,
+                "strategy": rec.get("strategy", ""),
+                "trail_enabled": bool(rec.get("trail_enabled", False)),
+                "trail_offset": Decimal(str(rec.get("trail_offset", "0"))),
+                "trail_extreme": Decimal(str(rec.get("trail_extreme", rec_price))),
+            }
+        except (KeyError, ValueError, TypeError, InvalidOperation) as exc:
+            # A corrupt field in an otherwise-matching record must refuse
+            # cleanly, not crash run_session with an uncaught exception.
+            logger.error("carried-adopt refuse: corrupt record for %s: %s", symbol, exc)
+            return None
+    absent = set(rec_by_sym) - set(broker_positions)
+    if absent:
+        logger.info("carried positions exited overnight (not adopted): %s", sorted(absent))
+    return adopted
+
+
+def _clear_carried_records(config: SessionConfig) -> None:
+    """Delete all carried-position records (best-effort). Called once a record
+    has been consumed by adoption so it cannot be matched again."""
+    root = _resolve_dir(config.carried_dir, _DEFAULT_CARRIED_DIR)
+    if not root.exists():
+        return
+    for path in root.glob("CARRIED_*.json"):
+        try:
+            path.unlink()
+        except OSError:
+            logger.exception("failed to remove consumed carried record %s", path)
+
+
 def _normalize_status(status: object) -> str:
     """Lowercase a broker status and strip any enum prefix.
 
@@ -754,6 +973,7 @@ def _build_order(
     stop_price: Decimal | None,
     take_price: Decimal | None,
     client_order_id: str,
+    time_in_force: str = "day",
 ) -> ProposedOrder:
     return ProposedOrder(
         symbol=symbol,
@@ -763,6 +983,7 @@ def _build_order(
         stop_price=stop_price,
         take_price=take_price,
         client_order_id=client_order_id,
+        time_in_force=time_in_force,
     )
 
 
@@ -773,6 +994,7 @@ def _handle_entry_signal(
     risk_params: RiskParams,
     sess: SessionState,
     sleep_fn=time.sleep,
+    protect_overnight: bool = False,
 ) -> BrokerOrderResponse | None:
     symbol = str(sig["symbol"])
     side_str = str(sig["side"])
@@ -814,6 +1036,8 @@ def _handle_entry_signal(
         return None
 
     client_id = f"orb-{symbol}-{sig['timestamp'].isoformat()}-{sess.run_id}"
+    # GTC so the broker-side bracket survives the close when the operator has
+    # opted into overnight holding; otherwise DAY (expires at close).
     order = _build_order(
         symbol=symbol,
         side=side,
@@ -821,6 +1045,7 @@ def _handle_entry_signal(
         stop_price=stop,
         take_price=take,
         client_order_id=client_id,
+        time_in_force="gtc" if protect_overnight else "day",
     )
 
     decision = validate_order(
@@ -1245,21 +1470,38 @@ def run_session(
             "proceeding — main loop will retry"
         )
         existing_positions = {}
+    # Adopted overnight positions, applied to sess.open_entries after creation.
+    adopted_entries: dict = {}
     if existing_positions and not config.force_ignore_unreconciled:
-        symbols = ", ".join(sorted(existing_positions.keys()))
-        logger.error(
-            "refusing to start: orphan broker positions detected",
-            extra={"positions": list(existing_positions.keys())},
+        # Phase 3: when overnight holding is enabled, broker positions that
+        # STRICTLY match a fresh carried-position record are adopted (the
+        # intentional-carry case) rather than refused. A sentinel blocker above
+        # always takes precedence — a carried record never overrides it. Any
+        # position that does not match still hits the orphan refusal below.
+        if config.protect_overnight:
+            record = _load_carried_record(config, now_fn())
+            if record is not None:
+                adopted_entries = _adopt_carried_positions(record, existing_positions) or {}
+        if not adopted_entries:
+            symbols = ", ".join(sorted(existing_positions.keys()))
+            logger.error(
+                "refusing to start: orphan broker positions detected",
+                extra={"positions": list(existing_positions.keys())},
+            )
+            raise RuntimeError(
+                f"Refusing to start: {len(existing_positions)} open broker "
+                f"position(s) ({symbols}) without a clean shutdown record. "
+                "These may be orphans from a non-graceful prior exit (SIGKILL, "
+                "crash, power loss) — or they may be legitimate positions from "
+                "an intentional mid-day restart or out-of-band activity. "
+                "Reconcile manually (flatten at broker or verify intent), then "
+                "pass force_ignore_unreconciled=True to override."
+            )
+        logger.warning(
+            "adopting carried overnight positions",
+            extra={"positions": sorted(adopted_entries.keys())},
         )
-        raise RuntimeError(
-            f"Refusing to start: {len(existing_positions)} open broker "
-            f"position(s) ({symbols}) without a clean shutdown record. "
-            "These may be orphans from a non-graceful prior exit (SIGKILL, "
-            "crash, power loss) — or they may be legitimate positions from "
-            "an intentional mid-day restart or out-of-band activity. "
-            "Reconcile manually (flatten at broker or verify intent), then "
-            "pass force_ignore_unreconciled=True to override."
-        )
+        _clear_carried_records(config)
     if existing_positions and config.force_ignore_unreconciled:
         logger.error(
             "starting with pre-existing broker positions",
@@ -1269,6 +1511,10 @@ def run_session(
     sess = SessionState()
     sess.run_id = config.run_id or now_fn().strftime("%Y%m%dT%H%M%SZ")
     sess.trailing_stop_policy = dict(config.trailing_stop_policy)
+    # Adopt carried overnight positions so stop/take management and trade
+    # pairing continue for them (qty already reconciled to the broker above).
+    if adopted_entries:
+        sess.open_entries.update(adopted_entries)
 
     if install_signals:
         _install_signal_handlers(sess)
@@ -1457,6 +1703,7 @@ def run_session(
                     risk_params=risk_params,
                     sess=sess,
                     sleep_fn=sleep_fn,
+                    protect_overnight=config.protect_overnight,
                 )
 
             sess.consecutive_failures = 0  # Reset on success.
@@ -1558,6 +1805,17 @@ def run_session(
                     "positions_failed": list(sess.flatten_result.positions_failed),
                 },
             )
+    elif config.protect_overnight:
+        # Clean exit that intentionally leaves positions open: record them so
+        # the next start adopts (not refuses) them. Their GTC brackets remain
+        # the overnight protection. Skipped when flattening (nothing carried).
+        try:
+            remaining = broker.get_positions()
+        except BrokerError:
+            logger.exception("get_positions failed writing carried record")
+            remaining = {}
+        if remaining:
+            _write_carried_positions(config, sess, remaining, now_fn())
 
     logger.info(
         "session ended",
