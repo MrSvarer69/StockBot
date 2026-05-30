@@ -220,6 +220,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "known to be unreachable."
         ),
     )
+    p.add_argument(
+        "--protect-overnight",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL — hold positions overnight. Submits entries GTC so "
+            "the broker stop/take bracket survives the close, records open "
+            "positions on a clean exit, and adopts matching positions on the "
+            "next start. Requires confirming GTC-bracket acceptance on Alpaca "
+            "paper first (see scripts/probe_overnight_protection.py). Pair with "
+            "a strategy whose flat_by_et is null to actually carry overnight."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -370,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
         flatten_on_exit=args.flatten_on_exit,
         flatten_on_halt=not args.no_flatten_on_halt,
         force_ignore_unreconciled=args.force_unreconciled,
+        protect_overnight=args.protect_overnight,
         max_concurrent_entries=args.max_concurrent_entries,
         picker_min_ratio=picker_min_ratio,
         run_id=run_id,
