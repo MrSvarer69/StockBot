@@ -449,10 +449,22 @@ class AlpacaPaperBroker:
         quantized = _quantize_to_tick(new_stop_price)
 
         try:
+            # nested=True so a bracket's stop/take children are rolled under
+            # the parent's `.legs`. This is load-bearing: while the parent
+            # market order is still working (PENDING_NEW / PARTIALLY_FILLED),
+            # the stop child sits in `held` status nested under the parent and
+            # does NOT appear as a standalone top-level order. The previous
+            # flat (non-nested) query therefore found nothing and logged
+            # "no open stop leg found" on every poll — the bug observed in the
+            # 2026-05-27 session where trailing never ratcheted. We scan both
+            # the top-level orders (covers a child that has gone live after the
+            # parent filled) AND each order's `.legs` (covers the held child
+            # under a still-open parent).
             orders = self._ensure_trading().get_orders(
                 filter=GetOrdersRequest(
                     status=QueryOrderStatus.OPEN,
                     symbols=[symbol],
+                    nested=True,
                 )
             )
         except Exception as e:
@@ -464,6 +476,18 @@ class AlpacaPaperBroker:
                 e, f"get_orders for {symbol}"
             ) from e
 
+        # Flatten top-level orders together with any nested bracket children.
+        # `getattr(o, "legs", None)` is only traversed when it is a real
+        # list/tuple — an SDK order with no children exposes `legs=None`, and
+        # test doubles leave it unset; either way we must not try to iterate a
+        # non-sequence.
+        candidates = []
+        for o in orders:
+            candidates.append(o)
+            legs = getattr(o, "legs", None)
+            if isinstance(legs, (list, tuple)):
+                candidates.extend(legs)
+
         # Alpaca renders a bracket's stop child as one of these order_types
         # depending on SDK version / configuration. Use an explicit set rather
         # than a startswith() match so `"trailing_stop"` (a distinct Alpaca
@@ -473,7 +497,7 @@ class AlpacaPaperBroker:
         _STOP_LEG_TYPES = {"stop", "stop_loss", "stop_limit"}
         stop_legs = [
             o
-            for o in orders
+            for o in candidates
             if str(getattr(o, "order_type", "")).lower() in _STOP_LEG_TYPES
         ]
         if not stop_legs:

@@ -277,3 +277,126 @@ def test_daily_notional_cap_capped_rejects_over_threshold(tmp_path):
     )
     assert not decision.approved
     assert "daily notional cap hit" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# max_capital_usd is ALSO a hard total-exposure ceiling: open-position
+# exposure (cost basis) + the proposed order must not exceed the cap. This is
+# the check that was missing — the bug report showed ~$2k positions opened
+# against a $750 cap because only the percentage caps existed.
+# ---------------------------------------------------------------------------
+
+
+def test_capital_cap_order_alone_exceeds_ceiling_rejected(tmp_path):
+    """The original bug: a single entry worth more than the whole cap. With
+    max_capital_usd=$750 a 60-share @ $33 (~$1,990) entry must be rejected
+    by the capital ceiling (which is checked before the daily-flow cap)."""
+    params = _params(
+        max_capital_usd=Decimal("750"),
+        max_position_count=10,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    decision = validate_order(
+        _order(symbol="NSP", qty=Decimal("60")),
+        _state(),
+        params,
+        market_is_open=True,
+        current_price=Decimal("33.18"),
+    )
+    assert not decision.approved
+    assert "capital cap" in decision.reason
+
+
+def test_capital_cap_blocks_when_existing_plus_order_exceeds(tmp_path):
+    """$700 already deployed (cost basis) + a $100 new order = $800 > $750."""
+    params = _params(
+        max_capital_usd=Decimal("750"),
+        max_position_count=10,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    positions = {"AAPL": Position("AAPL", Decimal("7"), Decimal("100"))}  # $700
+    decision = validate_order(
+        _order(symbol="TSLA", qty=Decimal("10")),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),  # $100 order
+    )
+    assert not decision.approved
+    assert "capital cap" in decision.reason
+
+
+def test_capital_cap_allows_when_under_ceiling(tmp_path):
+    """$500 deployed + a $200 order = $700 <= $750, and $200 daily flow is
+    under the 0.50*750=$375 daily cap → approved."""
+    params = _params(
+        max_capital_usd=Decimal("750"),
+        max_position_count=10,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    positions = {"AAPL": Position("AAPL", Decimal("5"), Decimal("100"))}  # $500
+    decision = validate_order(
+        _order(symbol="TSLA", qty=Decimal("20")),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),  # $200 order
+    )
+    assert decision.approved
+
+
+def test_capital_cap_boundary_exactly_at_ceiling_allowed(tmp_path):
+    """$650 + $100 = $750 exactly; the comparison is strict `>` so it fits."""
+    params = _params(
+        max_capital_usd=Decimal("750"),
+        max_daily_notional_pct=Decimal("1.0"),  # don't let daily cap interfere
+        max_position_count=10,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    positions = {"AAPL": Position("AAPL", Decimal("6.5"), Decimal("100"))}  # $650
+    decision = validate_order(
+        _order(symbol="TSLA", qty=Decimal("10")),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),  # $100 order
+    )
+    assert decision.approved
+
+
+def test_capital_cap_excludes_own_symbol_from_existing_exposure(tmp_path):
+    """When the order's own symbol is already held, its existing exposure is
+    excluded so the add path is not double-counted against the cap."""
+    params = _params(
+        max_capital_usd=Decimal("750"),
+        max_position_count=10,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    # SPY alone is $700; if it were counted, SPY + $100 order = $800 > $750.
+    positions = {"SPY": Position("SPY", Decimal("7"), Decimal("100"))}
+    decision = validate_order(
+        _order(symbol="SPY", qty=Decimal("10")),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),  # $100 order
+    )
+    assert decision.approved
+
+
+def test_capital_cap_none_disables_ceiling(tmp_path):
+    """No cap configured → unbounded total exposure permitted (legacy default)."""
+    params = _params(
+        max_capital_usd=None,
+        max_position_count=10,
+        kill_file_path=str(tmp_path / "absent"),
+    )
+    positions = {"AAPL": Position("AAPL", Decimal("1000"), Decimal("100"))}  # $100k
+    decision = validate_order(
+        _order(symbol="TSLA", qty=Decimal("10")),
+        _state(open_positions=positions),
+        params,
+        market_is_open=True,
+        current_price=Decimal("10"),
+    )
+    assert decision.approved

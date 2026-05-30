@@ -108,11 +108,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Decimal,
         default=None,
         help=(
-            "Hard cap on the equity used for sizing and percent-based risk "
-            "caps. Set when the paper account ($100k) is larger than the "
-            "real-world bankroll you intend to deploy. Currency is USD; "
-            "convert from local currency externally (e.g. 3000 DKK at "
-            "~6.9 DKK/USD ≈ $435). Default: no cap (raw broker equity used)."
+            "Hard cap on deployable capital, in USD. Does two things: (1) "
+            "every percent-based risk calc sizes off min(equity, cap) instead "
+            "of raw broker equity, and (2) it is a hard total-exposure "
+            "ceiling — the risk layer blocks any new entry whose notional, "
+            "added to current open-position exposure, would exceed the cap. "
+            "Set when the paper account ($100k) is larger than the real-world "
+            "bankroll you intend to deploy. Convert from local currency "
+            "externally (e.g. 3000 DKK at ~6.9 DKK/USD ≈ $435). Default: no "
+            "cap (raw broker equity used; unbounded total exposure)."
         ),
     )
     p.add_argument(
@@ -351,7 +355,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_capital_usd is not None:
         logging.getLogger(__name__).info(
             "capital cap active: sizing and percent-based risk caps apply to "
-            "min(account_equity, $%s)",
+            "min(account_equity, $%s); total open-position exposure is "
+            "hard-capped at $%s",
+            args.max_capital_usd,
             args.max_capital_usd,
         )
     picker_min_ratio = (

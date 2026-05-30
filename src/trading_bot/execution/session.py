@@ -469,19 +469,55 @@ def _write_unreconciled_sentinel(
     return path
 
 
+def _normalize_status(status: object) -> str:
+    """Lowercase a broker status and strip any enum prefix.
+
+    The Alpaca adapter stores `str(OrderStatus.PARTIALLY_FILLED)` which renders
+    as `"OrderStatus.PARTIALLY_FILLED"`, while the test fakes use plain
+    `"filled"`/`"accepted"`. Normalize both to the bare token (e.g.
+    `"partially_filled"`) so status comparisons work against either source.
+    """
+    s = str(status).lower()
+    return s.rsplit(".", 1)[-1] if "." in s else s
+
+
+def _is_fully_filled(resp: BrokerOrderResponse, ordered_qty: Decimal) -> bool:
+    """True once the whole order is filled.
+
+    Two independent signals, either sufficient: a `filled` status, or
+    `filled_qty` reaching the ordered quantity. Using filled_qty makes this
+    robust to the partial-fill case where `filled_avg_price` becomes non-null
+    on the FIRST partial — which previously short-circuited the poll and let
+    the loop book the ordered qty as if the whole order had filled.
+    """
+    if _normalize_status(resp.status) == "filled":
+        return True
+    return (
+        resp.filled_qty is not None
+        and ordered_qty is not None
+        and resp.filled_qty >= ordered_qty
+    )
+
+
 def _await_fill(
     broker: BrokerClient,
     resp: BrokerOrderResponse,
     *,
     sleep_fn=time.sleep,
 ) -> BrokerOrderResponse:
-    """Poll the broker until the order has a fill price or attempts run out.
+    """Poll the broker until the order is fully filled, goes terminal, or
+    attempts run out.
 
-    Market orders return `accepted` synchronously; the fill arrives async.
-    Returns the freshest response we got. May still have `filled_avg_price=None`
-    on timeout — the caller logs a warning when it falls back.
+    Market orders return `accepted` synchronously; fills arrive async and may
+    arrive in pieces. We must NOT stop at the first partial fill: the caller
+    books `resp.filled_qty`, so returning a half-filled response would record
+    only part of the position (or, under the old `filled_avg_price is not
+    None` short-circuit, mislabel a partial as complete). Returns the freshest
+    response seen; on a stuck partial it returns that partial after the attempt
+    budget, and the caller records the actually-filled quantity.
     """
-    if resp.filled_avg_price is not None:
+    ordered_qty = resp.qty
+    if _is_fully_filled(resp, ordered_qty):
         return resp
     latest = resp
     for _ in range(_FILL_POLL_MAX_ATTEMPTS):
@@ -497,7 +533,7 @@ def _await_fill(
                 resp.broker_order_id,
             )
             continue
-        if latest.filled_avg_price is not None:
+        if _is_fully_filled(latest, ordered_qty):
             logger.info(
                 "order filled",
                 extra={
@@ -509,7 +545,9 @@ def _await_fill(
                 },
             )
             return latest
-        if latest.status in _TERMINAL_ORDER_STATUSES:
+        if _normalize_status(latest.status) in _TERMINAL_ORDER_STATUSES:
+            # rejected / canceled / expired / done_for_day — it will not fill
+            # any further; return whatever (possibly partial) fill we have.
             return latest
     return latest
 
@@ -547,6 +585,17 @@ def _record_entry(
         )
         entry_price = Decimal("0")
     entry_time = pd.Timestamp(resp.submitted_at)
+    # Book what actually filled, not what we asked for. A partially-filled
+    # market order reports filled_qty < order.qty; recording the ordered qty
+    # desyncs the bot's book from the broker and produces the later
+    # "close_position no-op: ... has no position" seen on 2026-05-27. Fall
+    # back to the ordered qty only when the broker reported no fill quantity
+    # at all (defensive; a real fill always carries a quantity).
+    fill_qty = (
+        resp.filled_qty
+        if resp.filled_qty is not None and resp.filled_qty > 0
+        else order.qty
+    )
     # Stash trailing-stop state if the producing strategy opts in AND a stop
     # was set at entry. trail_offset is a fixed dollar distance computed once
     # from entry_price and the initial stop; the ratchet engine in
@@ -565,7 +614,7 @@ def _record_entry(
         trail_extreme = entry_price
     sess.open_entries[symbol] = {
         "side": side,
-        "qty": order.qty,
+        "qty": fill_qty,
         "entry_price": entry_price,
         "entry_time": entry_time,
         "stop_price": order.stop_price,
@@ -579,7 +628,7 @@ def _record_entry(
         event="ENTRY",
         symbol=symbol,
         side=side,
-        qty=order.qty,
+        qty=fill_qty,
         price=entry_price,
         timestamp=entry_time,
         stop_price=order.stop_price,
@@ -593,7 +642,7 @@ def _record_entry(
             "symbol": symbol,
             "strategy": strategy,
             "side": side,
-            "qty": str(order.qty),
+            "qty": str(fill_qty),
             "entry_price": str(entry_price),
             "stop_price": str(order.stop_price) if order.stop_price else None,
             "take_price": str(order.take_price) if order.take_price else None,
@@ -789,8 +838,31 @@ def _handle_entry_signal(
         return None
 
     resp = broker.submit_order(decision.order)
-    sess.cumulative_notional_today += abs(order.qty) * current_price
     resp = _await_fill(broker, resp, sleep_fn=sleep_fn)
+    filled_qty = resp.filled_qty if resp.filled_qty is not None else Decimal("0")
+    if filled_qty <= 0:
+        # Nothing filled within the poll budget (or the order went terminal
+        # unfilled). Do not record a phantom position or charge notional — the
+        # bot holds nothing. The broker-side bracket, if any, guards a zero
+        # position trivially.
+        logger.warning(
+            "entry not filled; no position recorded",
+            extra={
+                "symbol": symbol,
+                "ordered_qty": str(order.qty),
+                "status": resp.status,
+                "broker_order_id": resp.broker_order_id,
+            },
+        )
+        return resp
+    # Count the actually-filled notional toward the daily cap, preferring the
+    # fill price and falling back to the price we sized against. Previously
+    # this added the full ordered qty at current_price BEFORE the fill was
+    # known, overstating deployed notional on partial fills.
+    fill_price = (
+        resp.filled_avg_price if resp.filled_avg_price is not None else current_price
+    )
+    sess.cumulative_notional_today += abs(filled_qty) * fill_price
     raw_strategy = sig.get("strategy", "")
     strategy = "" if raw_strategy is None or (isinstance(raw_strategy, float) and pd.isna(raw_strategy)) else str(raw_strategy)
     _record_entry(sess, symbol, side_str, decision.order, resp, strategy=strategy)

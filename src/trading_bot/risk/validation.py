@@ -87,6 +87,35 @@ def validate_order(
         from .sizing import effective_equity
 
         proposed_notional = abs(order.qty) * px
+
+        # Hard total-exposure ceiling. When max_capital_usd is set it is an
+        # absolute dollar cap on capital deployed at once: block this entry if
+        # the live open-position exposure plus the proposed order would exceed
+        # it. This is distinct from the percentage caps (which only *scale*
+        # their base by effective_equity) — those bound each trade and the
+        # daily flow, but nothing previously bounded total simultaneous
+        # holdings. Existing exposure is measured at cost basis
+        # (|qty| * avg_entry_price); the new order at current price. The
+        # order's own symbol is excluded from the existing sum so the (rare)
+        # add-to-position path is not double-counted — entries are skipped
+        # upstream when a position is already open, so in practice this only
+        # ever sums *other* symbols.
+        if params.max_capital_usd is not None:
+            existing_exposure = sum(
+                (
+                    abs(p.qty) * p.avg_entry_price
+                    for sym, p in state.open_positions.items()
+                    if sym != order.symbol
+                ),
+                _ZERO,
+            )
+            if existing_exposure + proposed_notional > params.max_capital_usd:
+                return _reject(
+                    f"capital cap: open exposure {existing_exposure} + order "
+                    f"{proposed_notional} > cap {params.max_capital_usd}",
+                    order,
+                )
+
         daily_cap = params.max_daily_notional_pct * effective_equity(state.equity, params)
         if state.cumulative_notional_today + proposed_notional > daily_cap:
             return _reject(

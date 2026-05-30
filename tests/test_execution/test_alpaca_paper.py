@@ -269,6 +269,51 @@ def test_replace_stop_price_multi_leg_uses_first_and_warns(caplog):
     assert any("multiple stop legs" in r.message for r in warn_records)
 
 
+def _make_parent_with_legs(legs: list[MagicMock], *, order_type: str = "market") -> MagicMock:
+    """A bracket parent order with nested child `.legs`.
+
+    Mirrors what Alpaca returns for `get_orders(..., nested=True)` while the
+    parent market order is still working: the stop/take children are `held`
+    and rolled under the parent rather than surfaced as top-level orders.
+    """
+    parent = MagicMock()
+    parent.id = "parent-1"
+    parent.order_type = order_type
+    parent.stop_price = None
+    parent.legs = legs
+    return parent
+
+
+def test_replace_stop_price_finds_nested_held_stop_leg():
+    """Regression for the 2026-05-27 'no open stop leg found' spam: while the
+    bracket parent is still working, its stop child is nested under the
+    parent's `.legs`. The adapter must traverse into `.legs` to find it."""
+    stop_child = _make_stop_leg(order_id="stop-child", stop_price="95.00")
+    parent = _make_parent_with_legs([stop_child])
+    broker, client = _broker_with_open_orders([parent])
+
+    result = broker.replace_stop_price("SPY", Decimal("96.50"))
+
+    assert result is True
+    assert client.replace_order_by_id.call_count == 1
+    assert client.replace_order_by_id.call_args.kwargs["order_id"] == "stop-child"
+    # The query must request nested orders or the child is invisible.
+    assert client.get_orders.call_args.kwargs["filter"].nested is True
+
+
+def test_replace_stop_price_nested_take_only_returns_false():
+    """A parent whose only nested child is the take-profit (limit) leg has no
+    stop to replace — must return False, not mistake the limit leg for a stop."""
+    take_child = _make_stop_leg(order_id="take-child", order_type="limit")
+    parent = _make_parent_with_legs([take_child])
+    broker, client = _broker_with_open_orders([parent])
+
+    result = broker.replace_stop_price("SPY", Decimal("96.50"))
+
+    assert result is False
+    assert client.replace_order_by_id.call_count == 0
+
+
 @pytest.mark.parametrize("order_type", ["stop", "STOP", "stop_loss", "stop_limit"])
 def test_replace_stop_price_detects_stop_family(order_type):
     """Alpaca surfaces the stop child as one of several order_type strings
