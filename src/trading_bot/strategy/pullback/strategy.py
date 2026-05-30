@@ -68,7 +68,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from ..base import empty_signals_frame
+from ..base import empty_signals_frame, infer_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +208,7 @@ class PullbackStrategy:
                 "bars must have a tz-aware DatetimeIndex (UTC expected)"
             )
 
-        symbol = self._infer_symbol(bars)
+        symbol = infer_symbol(bars)
         cfg = self.config
 
         et_index = bars.index.tz_convert(ET)
@@ -525,13 +525,3 @@ class PullbackStrategy:
             # Mirror into ``or_atr_ratio`` until the legacy picker migrates.
             "or_atr_ratio": score,
         }
-
-    @staticmethod
-    def _infer_symbol(bars: pd.DataFrame) -> str:
-        if "symbol" in bars.columns:
-            return str(bars["symbol"].iloc[0])
-        if isinstance(bars.index, pd.MultiIndex) and "symbol" in bars.index.names:
-            return str(bars.index.get_level_values("symbol")[0])
-        raise ValueError(
-            "bars must contain a 'symbol' column or a 'symbol' index level"
-        )

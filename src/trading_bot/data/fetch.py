@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Protocol
 
@@ -89,3 +90,45 @@ class ParquetBarFetcher:
         if timeframe != "1Min":
             raise NotImplementedError(f"timeframe {timeframe} not yet supported")
         return self._cache.read(symbol, start, end)
+
+
+def bars_for_range(
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    *,
+    cache: BarCache,
+    use_cache: bool,
+    api_key: str | None = None,
+    api_secret: str | None = None,
+) -> pd.DataFrame:
+    """Resolve bars for ``[start, end]``, preferring the cache when allowed.
+
+    Credentials default to the ``ALPACA_API_KEY`` / ``ALPACA_API_SECRET``
+    environment variables. With ``use_cache=False`` a fresh fetch is forced and
+    credentials are required (raises :class:`CredentialsMissingError`). With
+    ``use_cache=True`` missing days are fetched and cached when credentials are
+    present; otherwise it falls back to a best-effort cache-only read.
+
+    Extracted from the backtest/screen scripts, which all carried an identical
+    copy of this logic.
+    """
+    if api_key is None:
+        api_key = os.environ.get("ALPACA_API_KEY", "")
+    if api_secret is None:
+        api_secret = os.environ.get("ALPACA_API_SECRET", "")
+
+    if not use_cache:
+        # Forced fetch: AlpacaBarFetcher raises CredentialsMissingError if absent.
+        return AlpacaBarFetcher(api_key=api_key, api_secret=api_secret).fetch(
+            symbol, start, end
+        )
+    if not api_key or not api_secret:
+        # No credentials → cache-only mode (best-effort, may be incomplete).
+        return cache.read(symbol, start, end)
+    return cache.read_or_fetch(
+        symbol,
+        start,
+        end,
+        AlpacaBarFetcher(api_key=api_key, api_secret=api_secret),
+    )

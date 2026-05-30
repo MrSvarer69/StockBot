@@ -38,3 +38,16 @@ def empty_signals_frame() -> pd.DataFrame:
             "or_atr_ratio": pd.Series(dtype="float64"),
         }
     )
+
+
+def infer_symbol(bars: pd.DataFrame) -> str:
+    """Resolve the ticker a single-symbol BarsFrame describes.
+
+    Accepts either a ``symbol`` column or a ``symbol`` level on a MultiIndex.
+    Shared by the single-symbol strategies (orb, pullback).
+    """
+    if "symbol" in bars.columns:
+        return str(bars["symbol"].iloc[0])
+    if isinstance(bars.index, pd.MultiIndex) and "symbol" in bars.index.names:
+        return str(bars.index.get_level_values("symbol")[0])
+    raise ValueError("bars must contain a 'symbol' column or a 'symbol' index level")

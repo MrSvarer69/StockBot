@@ -14,12 +14,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import uuid4
 
 import pandas as pd
 
 from trading_bot.contracts import OrderSide, OrderType, ProposedOrder, RiskParams
-from trading_bot.execution.broker import BrokerError, BrokerOrderResponse
+from trading_bot.execution.broker import BrokerOrderResponse
 from trading_bot.execution.session import (
     SessionState,
     _await_fill,

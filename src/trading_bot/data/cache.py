@@ -128,10 +128,10 @@ class BarCache:
         (~4d) and Christmas/New Year stretches (4-5d). A trading-calendar
         lookup would be exact; 5 is the pragmatic non-dep approach.
 
-        Pre-fix `_bars_for_range` helpers in the scripts returned ANY cached
-        data as authoritative — so a partial cache (e.g. 4 of 30 trading
-        days) would silently produce an under-sampled backtest. This method
-        is the central fix.
+        Pre-fix, the scripts' bar-loading helpers returned ANY cached data as
+        authoritative — so a partial cache (e.g. 4 of 30 trading days) would
+        silently produce an under-sampled backtest. This method is the central
+        fix (now reached via `data.bars_for_range`).
 
         Intended for completed-session ranges. Calling with an `end` that
         lands inside an in-progress session can cause `self.write` to

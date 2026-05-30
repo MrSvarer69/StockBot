@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yaml
 
-from ..base import empty_signals_frame
+from ..base import empty_signals_frame, infer_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class ORBStrategy:
         if not isinstance(bars.index, pd.DatetimeIndex) or bars.index.tz is None:
             raise ValueError("bars must have a tz-aware DatetimeIndex (UTC expected)")
 
-        symbol = self._infer_symbol(bars)
+        symbol = infer_symbol(bars)
         et_index = bars.index.tz_convert(ET)
         session_dates = pd.Series(et_index.date, index=bars.index).unique()
 
@@ -263,7 +263,11 @@ class ORBStrategy:
             else:
                 atr = atr_raw
             ratio = or_range / atr if atr > 0 else float("inf")
-            self._logger.debug(
+            # INFO, not DEBUG: this per-session record is the audit trail the
+            # 2026-05-14 review required so post-mortems can see whether the
+            # cold-start fallback disarmed the min-range filter. Production runs
+            # at INFO, so a DEBUG record would never be written.
+            self._logger.info(
                 "ORB filter check",
                 extra={
                     "symbol": symbol,
@@ -401,13 +405,3 @@ class ORBStrategy:
             # Quality score: OR range / session-scale ATR. Higher = larger
             "or_atr_ratio": or_atr_ratio,
         }
-
-    @staticmethod
-    def _infer_symbol(bars: pd.DataFrame) -> str:
-        if "symbol" in bars.columns:
-            return str(bars["symbol"].iloc[0])
-        if isinstance(bars.index, pd.MultiIndex) and "symbol" in bars.index.names:
-            return str(bars.index.get_level_values("symbol")[0])
-        raise ValueError(
-            "bars must contain a 'symbol' column or a 'symbol' index level"
-        )

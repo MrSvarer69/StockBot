@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -27,7 +26,7 @@ from dotenv import load_dotenv
 
 from trading_bot.backtest import BacktestCosts, run_backtest
 from trading_bot.contracts import BacktestResult, RiskParams
-from trading_bot.data import AlpacaBarFetcher, BarCache, ParquetBarFetcher
+from trading_bot.data import BarCache, bars_for_range
 from trading_bot.ops import render_summary_line, render_trade_table, setup_logging
 from trading_bot.strategy import ORBStrategy, load_config
 
@@ -79,36 +78,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Root of the backtest reports directory (default: data/backtests)",
     )
     return p.parse_args(argv)
-
-
-def _bars_for_range(
-    symbol: str,
-    start: datetime,
-    end: datetime,
-    *,
-    cache: BarCache,
-    use_cache: bool,
-):
-    """Return the symbol's BarsFrame, populating the cache from Alpaca if needed."""
-    api_key = os.environ.get("ALPACA_API_KEY", "")
-    api_secret = os.environ.get("ALPACA_API_SECRET", "")
-    if not use_cache:
-        if not api_key or not api_secret:
-            raise SystemExit(
-                "ERROR: ALPACA_API_KEY/ALPACA_API_SECRET required to fetch bars"
-            )
-        return AlpacaBarFetcher(api_key=api_key, api_secret=api_secret).fetch(
-            symbol, start, end
-        )
-    if not api_key or not api_secret:
-        # No credentials → cache-only mode (best-effort, may be incomplete).
-        return cache.read(symbol, start, end)
-    return cache.read_or_fetch(
-        symbol,
-        start,
-        end,
-        AlpacaBarFetcher(api_key=api_key, api_secret=api_secret),
-    )
 
 
 def _write_report(
@@ -210,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     cache = BarCache(Path(args.bars_dir))
     use_cache = not args.no_cache
 
-    bars = _bars_for_range(
+    bars = bars_for_range(
         args.symbol, start, end, cache=cache, use_cache=use_cache
     )
     if bars.empty:

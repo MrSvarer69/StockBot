@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,10 +33,6 @@ class TickerMap:
             cache_key="files/company_tickers.json",
         )
         return cls._parse(body)
-
-    @classmethod
-    def from_file(cls, path: Path) -> "TickerMap":
-        return cls._parse(Path(path).read_text(encoding="utf-8"))
 
     @classmethod
     def _parse(cls, body: str) -> "TickerMap":

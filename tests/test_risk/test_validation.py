@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 
 from trading_bot.risk import (
@@ -197,9 +198,12 @@ def test_daily_notional_cap_skipped_without_price(tmp_path, caplog):
     """No current_price + no limit_price means we cannot enforce — log + allow."""
     params = _params(kill_file_path=str(tmp_path / "absent"))
     state = _state(cumulative_notional_today=Decimal("99999999"))
-    decision = validate_order(_order(), state, params, market_is_open=True)
+    with caplog.at_level(logging.WARNING, logger="trading_bot.risk.validation"):
+        decision = validate_order(_order(), state, params, market_is_open=True)
     # Approved because we cannot compute notional without a price.
     assert decision.approved
+    # ...but the skipped cap check must leave an audit trail.
+    assert any("daily notional cap skipped" in r.message for r in caplog.records)
 
 
 def test_daily_notional_uses_limit_price_when_market_price_absent(tmp_path):

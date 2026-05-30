@@ -24,7 +24,7 @@ import logging
 import math
 import os
 import sys
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -517,7 +517,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # Per-cell aggregates (use 3 bps as the acceptance-bar slippage).
     aggregate_rows: list[dict] = []
-    pearson_rows: list[dict] = []
     for strategy in sorted({c[0] for c in cells}):
         for hp in HOLDING_PERIODS:
             trades_1bp = cells.get((strategy, hp, "1bp"), [])

@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from trading_bot.contracts import OrderSide, RiskParams
-from trading_bot.execution import SessionConfig, run_session  # noqa: F401
+from trading_bot.execution import SessionConfig, run_session
 from trading_bot.strategy import ORBStrategy, load_config
 
 from tests.test_execution.fakes import FakeBroker
@@ -2059,7 +2059,7 @@ def test_stale_flat_signal_still_fires():
         max_signal_age_minutes=5,
         force_ignore_unreconciled=True,  # pre-seeded position
     )
-    state = run_session(
+    run_session(
         broker,
         _strategy(),
         config,
@@ -2090,7 +2090,7 @@ def test_fresh_signal_passes_staleness_guard():
         flatten_on_exit=False,
         max_signal_age_minutes=60,
     )
-    state = run_session(
+    run_session(
         broker,
         _strategy(),
         config,

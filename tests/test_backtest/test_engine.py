@@ -5,7 +5,6 @@ from decimal import Decimal
 
 import pandas as pd
 
-import pandas as pd
 
 from trading_bot.backtest import BacktestCosts, run_backtest
 from trading_bot.contracts import RiskParams

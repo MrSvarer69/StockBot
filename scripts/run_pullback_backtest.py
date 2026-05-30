@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import os
 import sys
 from dataclasses import asdict
 from datetime import UTC, datetime, time, timedelta
@@ -30,7 +29,7 @@ from dotenv import load_dotenv
 
 from trading_bot.backtest import BacktestCosts, run_backtest
 from trading_bot.contracts import RiskParams
-from trading_bot.data import AlpacaBarFetcher, BarCache
+from trading_bot.data import BarCache, bars_for_range
 from trading_bot.ops import setup_logging
 from trading_bot.strategy.pullback.strategy import (
     PullbackStrategy,
@@ -77,27 +76,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Acceptance bar: trade count must be >= this in BOTH halves.",
     )
     return p.parse_args(argv)
-
-
-def _bars_for_range(
-    symbol: str, start: datetime, end: datetime, *, cache: BarCache, use_cache: bool,
-):
-    api_key = os.environ.get("ALPACA_API_KEY", "")
-    api_secret = os.environ.get("ALPACA_API_SECRET", "")
-    if not use_cache:
-        if not api_key or not api_secret:
-            raise SystemExit(
-                "ERROR: ALPACA_API_KEY/ALPACA_API_SECRET required to fetch bars"
-            )
-        return AlpacaBarFetcher(api_key=api_key, api_secret=api_secret).fetch(
-            symbol, start, end,
-        )
-    if not api_key or not api_secret:
-        return cache.read(symbol, start, end)
-    return cache.read_or_fetch(
-        symbol, start, end,
-        AlpacaBarFetcher(api_key=api_key, api_secret=api_secret),
-    )
 
 
 def _run_one(bars, *, cfg, initial_cash, risk_params, costs, symbol):
@@ -179,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     skipped: list[tuple[str, str]] = []
     for sym in symbols:
         try:
-            bars = _bars_for_range(
+            bars = bars_for_range(
                 sym, start, end, cache=cache, use_cache=use_cache,
             )
         except Exception as exc:

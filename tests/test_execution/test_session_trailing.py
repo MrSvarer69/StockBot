@@ -471,7 +471,7 @@ def caplog_at_session_info():
     records: list[_logging.LogRecord] = []
 
     class _Handler(_logging.Handler):
-        def emit(self, record):  # noqa: D401 - logging API
+        def emit(self, record):
             records.append(record)
 
     handler = _Handler(level=_logging.INFO)

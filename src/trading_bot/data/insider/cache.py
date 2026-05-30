@@ -86,17 +86,13 @@ class Form4Cache:
         for part in self.root.rglob("*.parquet"):
             try:
                 table = pq.read_table(part, columns=["accession_no"])
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("failed to read accessions from %s", part)
                 continue
             accessions.update(
                 v.as_py() for v in table.column("accession_no") if v.as_py() is not None
             )
         return accessions
-
-    def empty_table(self) -> pa.Table:
-        """Empty table with canonical schema. Useful for callers needing a base."""
-        return filings_to_arrow_table([])
 
     @property
     def schema(self) -> pa.Schema:

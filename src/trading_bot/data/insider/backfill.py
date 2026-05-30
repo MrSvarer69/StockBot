@@ -16,7 +16,6 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
 
 from .cache import Form4Cache
 from .client import EdgarClient, EdgarHTTPError

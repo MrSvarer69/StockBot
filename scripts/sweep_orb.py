@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
@@ -26,7 +25,7 @@ from dotenv import load_dotenv
 
 from trading_bot.backtest import BacktestCosts, run_backtest
 from trading_bot.contracts import RiskParams
-from trading_bot.data import AlpacaBarFetcher, BarCache
+from trading_bot.data import BarCache, bars_for_range
 from trading_bot.ops import setup_logging
 from trading_bot.strategy import ORBStrategy, load_config
 from trading_bot.strategy.orb.strategy import ORBConfig
@@ -71,27 +70,6 @@ def _coerce(value_str: str, field_name: str):
     if field_name in {"opening_range_minutes", "atr_period_sessions"}:
         return int(value_str)
     return float(value_str)
-
-
-def _bars_for_range(symbol: str, start, end, *, cache: BarCache, use_cache: bool):
-    api_key = os.environ.get("ALPACA_API_KEY", "")
-    api_secret = os.environ.get("ALPACA_API_SECRET", "")
-    if not use_cache:
-        if not api_key or not api_secret:
-            raise SystemExit(
-                "ERROR: ALPACA_API_KEY/ALPACA_API_SECRET required to fetch bars"
-            )
-        return AlpacaBarFetcher(api_key=api_key, api_secret=api_secret).fetch(
-            symbol, start, end
-        )
-    if not api_key or not api_secret:
-        return cache.read(symbol, start, end)
-    return cache.read_or_fetch(
-        symbol,
-        start,
-        end,
-        AlpacaBarFetcher(api_key=api_key, api_secret=api_secret),
-    )
 
 
 def _format_metric(value, decimals: int = 4) -> str:
@@ -178,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cache = BarCache(Path(args.bars_dir))
     use_cache = not args.no_cache
-    bars = _bars_for_range(args.symbol, start, end, cache=cache, use_cache=use_cache)
+    bars = bars_for_range(args.symbol, start, end, cache=cache, use_cache=use_cache)
     if bars.empty:
         print(f"ERROR: no bars for {args.symbol} in range", file=sys.stderr)
         return 1
