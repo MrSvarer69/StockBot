@@ -283,10 +283,11 @@ def test_replace_stop_price_returns_false_when_no_stop_leg_found():
     assert client.replace_order_by_id.call_count == 0
 
 
-def test_replace_stop_price_multi_leg_uses_first_and_warns(caplog):
-    """Two open stop-class orders on the same symbol is malformed (a real
-    Alpaca bracket has exactly one stop child). The adapter takes the first
-    and warns so the operator notices the broken state."""
+def test_replace_stop_price_multi_live_leg_refuses_and_warns(caplog):
+    """Two genuinely live stop legs on one symbol means more than one open
+    bracket — the adapter can't know which one the caller's new_stop targets.
+    It must refuse (return False, issue NO replace) and warn, leaving the
+    existing stops in place rather than ratcheting the wrong one."""
     leg_a = _make_stop_leg(order_id="leg-a", stop_price="95.00")
     leg_b = _make_stop_leg(order_id="leg-b", stop_price="94.50")
     broker, client = _broker_with_open_orders([leg_a, leg_b])
@@ -294,15 +295,12 @@ def test_replace_stop_price_multi_leg_uses_first_and_warns(caplog):
     with caplog.at_level(logging.WARNING, logger="trading_bot.execution.alpaca_paper"):
         result = broker.replace_stop_price("SPY", Decimal("96.50"))
 
-    assert result is True
-    # Replace was called against leg-a, not leg-b.
-    assert client.replace_order_by_id.call_count == 1
-    assert client.replace_order_by_id.call_args.kwargs["order_id"] == "leg-a"
-    # Warning record was emitted naming the multi-leg situation.
+    assert result is False
+    assert client.replace_order_by_id.call_count == 0
     warn_records = [
         r for r in caplog.records if r.levelno == logging.WARNING
     ]
-    assert any("multiple stop legs" in r.message for r in warn_records)
+    assert any("multiple live stop legs" in r.message for r in warn_records)
 
 
 def _make_parent_with_legs(legs: list[MagicMock], *, order_type: str = "market") -> MagicMock:
@@ -345,6 +343,144 @@ def test_replace_stop_price_nested_take_only_returns_false():
     broker, client = _broker_with_open_orders([parent])
 
     result = broker.replace_stop_price("SPY", Decimal("96.50"))
+
+    assert result is False
+    assert client.replace_order_by_id.call_count == 0
+
+
+def _make_leg(*, order_id, order_type, status, stop_price=None, limit_price=None):
+    """A leg/order shaped like the *live* SDK return: `order_type` and `status`
+    are enum reprs ("OrderType.STOP" / "OrderStatus.HELD"), not bare lowercase
+    strings. The lowercase-string mocks above never exercised the enum-repr
+    path, which is why both the OPEN-filter and exact-match-type bugs survived.
+    """
+    o = MagicMock()
+    o.id = order_id
+    o.order_type = order_type
+    o.status = status
+    o.stop_price = stop_price
+    o.limit_price = limit_price
+    o.legs = None
+    return o
+
+
+def test_replace_stop_price_finds_held_stop_under_filled_parent():
+    """Regression for the 2026-06-02 XLE failure: once the bracket's market
+    parent FILLS, the stop child sits HELD nested under the (now closed) parent.
+    A status=OPEN query drops both, surfacing only the live take-profit limit
+    leg. The adapter must query ALL and find the held stop child."""
+    from alpaca.trading.enums import QueryOrderStatus
+
+    held_stop = _make_leg(
+        order_id="stop-child", order_type="OrderType.STOP",
+        status="OrderStatus.HELD", stop_price="56.41",
+    )
+    live_limit = _make_leg(
+        order_id="take-child", order_type="OrderType.LIMIT",
+        status="OrderStatus.NEW", limit_price="60.59",
+    )
+    filled_parent = MagicMock()
+    filled_parent.id = "parent-filled"
+    filled_parent.order_type = "OrderType.MARKET"
+    filled_parent.status = "OrderStatus.FILLED"
+    filled_parent.stop_price = None
+    filled_parent.legs = [live_limit, held_stop]
+
+    broker, client = _broker_with_open_orders([filled_parent])
+
+    result = broker.replace_stop_price("XLE", Decimal("56.49"))
+
+    assert result is True
+    assert client.replace_order_by_id.call_count == 1
+    assert client.replace_order_by_id.call_args.kwargs["order_id"] == "stop-child"
+    # Must query ALL — OPEN would never return the closed parent or its held leg.
+    assert client.get_orders.call_args.kwargs["filter"].status == QueryOrderStatus.ALL
+    assert client.get_orders.call_args.kwargs["filter"].nested is True
+    # And it must be bounded so the live bracket can't silently fall off the
+    # default page and revert to "no stop found" (frozen trail).
+    assert client.get_orders.call_args.kwargs["filter"].limit is not None
+
+
+def test_replace_stop_price_ignores_stopped_stop_leg():
+    """A stop leg in `STOPPED` (already triggered/executed) is terminal — the
+    adapter must not attempt to re-replace a fired stop."""
+    fired = _make_leg(
+        order_id="fired-stop", order_type="OrderType.STOP",
+        status="OrderStatus.STOPPED", stop_price="56.41",
+    )
+    broker, client = _broker_with_open_orders([fired])
+
+    result = broker.replace_stop_price("XLE", Decimal("56.49"))
+
+    assert result is False
+    assert client.replace_order_by_id.call_count == 0
+
+
+def test_replace_stop_price_ignores_terminal_canceled_stop_leg():
+    """status=ALL also returns prior completed brackets. A CANCELED stop child
+    is dead — it must not be selected or replaced."""
+    dead_stop = _make_leg(
+        order_id="dead-stop", order_type="OrderType.STOP",
+        status="OrderStatus.CANCELED", stop_price="59.33",
+    )
+    done_parent = MagicMock()
+    done_parent.id = "parent-done"
+    done_parent.order_type = "OrderType.MARKET"
+    done_parent.status = "OrderStatus.FILLED"
+    done_parent.stop_price = None
+    done_parent.legs = [dead_stop]
+
+    broker, client = _broker_with_open_orders([done_parent])
+
+    result = broker.replace_stop_price("XLE", Decimal("56.49"))
+
+    assert result is False
+    assert client.replace_order_by_id.call_count == 0
+
+
+def test_replace_stop_price_picks_live_stop_over_dead_bracket(caplog):
+    """With a prior completed bracket (CANCELED stop) AND the current live
+    bracket (HELD stop) both returned by status=ALL, the adapter must replace
+    the live HELD leg and must NOT warn about multiple stop legs."""
+    dead_stop = _make_leg(
+        order_id="dead-stop", order_type="OrderType.STOP",
+        status="OrderStatus.CANCELED", stop_price="59.33",
+    )
+    held_stop = _make_leg(
+        order_id="live-stop", order_type="OrderType.STOP",
+        status="OrderStatus.HELD", stop_price="56.41",
+    )
+    done_parent = MagicMock()
+    done_parent.id = "p-done"; done_parent.order_type = "OrderType.MARKET"
+    done_parent.status = "OrderStatus.FILLED"; done_parent.stop_price = None
+    done_parent.legs = [dead_stop]
+    live_parent = MagicMock()
+    live_parent.id = "p-live"; live_parent.order_type = "OrderType.MARKET"
+    live_parent.status = "OrderStatus.FILLED"; live_parent.stop_price = None
+    live_parent.legs = [held_stop]
+
+    broker, client = _broker_with_open_orders([live_parent, done_parent])
+
+    with caplog.at_level(logging.WARNING, logger="trading_bot.execution.alpaca_paper"):
+        result = broker.replace_stop_price("XLE", Decimal("56.49"))
+
+    assert result is True
+    assert client.replace_order_by_id.call_count == 1
+    assert client.replace_order_by_id.call_args.kwargs["order_id"] == "live-stop"
+    assert not any("multiple stop legs" in r.message for r in caplog.records)
+
+
+def test_replace_stop_price_ignores_broker_trailing_stop_leg():
+    """A broker-side `trailing_stop` family leg (enum repr "OrderType.TRAILING_STOP")
+    must NOT be picked up — the bot trails stops itself; overwriting a
+    broker-managed trailing leg would be wrong."""
+    trail = _make_leg(
+        order_id="trail", order_type="OrderType.TRAILING_STOP",
+        status="OrderStatus.NEW", stop_price="55.00",
+    )
+    broker, client = _broker_with_open_orders([trail])
+
+    result = broker.replace_stop_price("XLE", Decimal("56.49"))
 
     assert result is False
     assert client.replace_order_by_id.call_count == 0

@@ -242,10 +242,12 @@ class AlpacaPaperBroker:
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
         # GTC keeps the bracket stop/take alive past the session close so a
         # position held overnight stays protected; DAY (default) expires them
-        # at 16:00 ET. NOTE: whether Alpaca accepts GTC on a *market*-parent
-        # bracket must be confirmed on live paper — if it is rejected, the
-        # fallback is a post-fill GTC OCO swap (see plan Phase 2). submit_order
-        # raises (loudly, never silently) on a broker rejection.
+        # at 16:00 ET. Confirmed on live paper 2026-06-01 (probe-overnight check
+        # #1): Alpaca accepts GTC on a *market*-parent bracket and carries both
+        # stop/take legs as GTC, so no post-fill OCO swap is needed today; if a
+        # future broker change rejects market-parent GTC, the fallback is a
+        # post-fill GTC OCO swap (see plan Phase 2). submit_order raises (loudly,
+        # never silently) on a broker rejection.
         tif = TimeInForce.GTC if order.time_in_force == "gtc" else TimeInForce.DAY
         has_stop = order.stop_price is not None
         has_take = order.take_price is not None
@@ -448,8 +450,9 @@ class AlpacaPaperBroker:
         briefly unprotected by a cancel+place race. Returns True on
         successful replacement or no-op (already at the requested price);
         returns False if there is no open stop leg to replace (position
-        already closed, bracket already fired). Raises BrokerError on
-        fatal failures.
+        already closed, bracket already fired) OR if more than one genuinely
+        live stop leg exists for the symbol (ambiguous — see below). Raises
+        BrokerError on fatal failures.
         """
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest, ReplaceOrderRequest
@@ -457,22 +460,32 @@ class AlpacaPaperBroker:
         quantized = _quantize_to_tick(new_stop_price)
 
         try:
-            # nested=True so a bracket's stop/take children are rolled under
-            # the parent's `.legs`. This is load-bearing: while the parent
-            # market order is still working (PENDING_NEW / PARTIALLY_FILLED),
-            # the stop child sits in `held` status nested under the parent and
-            # does NOT appear as a standalone top-level order. The previous
-            # flat (non-nested) query therefore found nothing and logged
-            # "no open stop leg found" on every poll — the bug observed in the
-            # 2026-05-27 session where trailing never ratcheted. We scan both
-            # the top-level orders (covers a child that has gone live after the
-            # parent filled) AND each order's `.legs` (covers the held child
-            # under a still-open parent).
+            # Query ALL (symbol-filtered, newest-first) with nested=True, NOT
+            # OPEN. A bracket's protective stop child sits in `HELD` status
+            # nested under the *filled* parent: once the market parent fills,
+            # Alpaca keeps the OCO pair as children of the now-closed parent and
+            # holds the stop leg until the take-profit is touched.
+            # QueryOrderStatus.OPEN excludes BOTH the closed parent AND its held
+            # leg, so an OPEN query surfaces only the live take-profit limit leg
+            # — the adapter then logged "no open stop leg found" every poll and
+            # trailing never ratcheted (observed 2026-05-27 and again 2026-06-02
+            # on XLE: parent FILLED, stop child HELD@56.41, invisible to OPEN).
+            # ALL makes the filled parent and its held stop child visible; the
+            # terminal-status filter below drops prior completed brackets.
+            # Bound the page with an explicit `limit` (newest-first) so the
+            # live bracket can never silently fall off the default page and
+            # revert this method to "no stop found" → frozen trail. We do NOT
+            # add an `after` time window: this broker backs overnight holds, so
+            # the protective bracket's parent may have filled on a *prior*
+            # session — a same-day window would re-hide exactly the overnight
+            # stop this path exists to protect. The query is symbol-scoped, so
+            # per-symbol order volume stays small and 100 is comfortably ample.
             orders = self._ensure_trading().get_orders(
                 filter=GetOrdersRequest(
-                    status=QueryOrderStatus.OPEN,
+                    status=QueryOrderStatus.ALL,
                     symbols=[symbol],
                     nested=True,
+                    limit=100,
                 )
             )
         except Exception as e:
@@ -496,18 +509,40 @@ class AlpacaPaperBroker:
             if isinstance(legs, (list, tuple)):
                 candidates.extend(legs)
 
-        # Alpaca renders a bracket's stop child as one of these order_types
-        # depending on SDK version / configuration. Use an explicit set rather
-        # than a startswith() match so `"trailing_stop"` (a distinct Alpaca
-        # family with broker-managed dynamic stops) is NOT picked up — the
-        # bot's trailing logic is intentionally bot-side; a broker-side
-        # trailing leg must not be silently overwritten by this method.
-        _STOP_LEG_TYPES = {"stop", "stop_loss", "stop_limit"}
-        stop_legs = [
-            o
-            for o in candidates
-            if str(getattr(o, "order_type", "")).lower() in _STOP_LEG_TYPES
-        ]
+        # Substring-match the order_type, not exact membership: the live SDK
+        # hands back an `OrderType` enum whose `str()` is "OrderType.STOP"
+        # (lowercased "ordertype.stop"), so an exact `in {"stop", ...}` test
+        # never fires on real broker data — the same enum-repr trap the probe
+        # hit with OrderType.LIMIT. Match any type containing "stop" while
+        # explicitly excluding "trailing_stop" (a distinct Alpaca family with
+        # broker-managed dynamic stops): the bot's trailing logic is
+        # intentionally bot-side, so a broker-side trailing leg must not be
+        # silently overwritten here. This covers "stop", "stop_loss",
+        # "stop_limit" and their "OrderType.*" enum reprs.
+        #
+        # Exclude terminal legs by status: status=ALL also returns prior
+        # completed brackets whose stop child is CANCELED/FILLED/etc. Selecting
+        # one would replace a dead order or, with two, trip the multi-leg
+        # warning against history. Status is matched as a substring for the
+        # same enum-repr reason ("OrderStatus.CANCELED"); a leg with no/unknown
+        # status is treated as live, so the simpler unit-test mocks still match.
+        # "stopped" = the stop already triggered/executed → terminal, must not
+        # be re-replaced. ("partially_filled" contains "filled" and is thus
+        # treated terminal too: a half-filled stop means the position is partly
+        # gone and should not keep ratcheting — acceptable and intentional.)
+        _TERMINAL_STATUSES = (
+            "filled", "canceled", "expired",
+            "rejected", "replaced", "done_for_day", "stopped",
+        )
+
+        def _is_live_stop(o) -> bool:
+            type_str = str(getattr(o, "order_type", "")).lower()
+            if "stop" not in type_str or "trailing" in type_str:
+                return False
+            status_str = str(getattr(o, "status", "")).lower()
+            return not any(t in status_str for t in _TERMINAL_STATUSES)
+
+        stop_legs = [o for o in candidates if _is_live_stop(o)]
         if not stop_legs:
             logger.info(
                 "replace_stop_price: no open stop leg found",
@@ -515,10 +550,18 @@ class AlpacaPaperBroker:
             )
             return False
         if len(stop_legs) > 1:
+            # Two+ genuinely live stop legs means more than one open
+            # bracket/position on this symbol. We cannot tell which one the
+            # caller's `new_stop_price` was computed for, and ratcheting the
+            # wrong bracket's stop could stop it out prematurely or loosen the
+            # other's protection. Refuse and warn rather than guess `[0]`: the
+            # existing stops stay in place (the position remains protected at
+            # current levels) and the caller treats False as "skip this poll".
             logger.warning(
-                "replace_stop_price: multiple stop legs found; using first",
+                "replace_stop_price: multiple live stop legs; refusing to guess",
                 extra={"symbol": symbol, "count": len(stop_legs)},
             )
+            return False
         leg = stop_legs[0]
 
         existing = getattr(leg, "stop_price", None)
