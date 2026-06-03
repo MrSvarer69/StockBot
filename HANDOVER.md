@@ -6,6 +6,98 @@
 
 ---
 
+## Where we left off (2026-06-03 — stale-entry recovery shipped; risk-approved with conditions resolved; uncommitted)
+
+Diagnosed why the bot "isn't really trading": the host kept being off/asleep exactly when ORB
+breakouts fired (06-03 log: signals at 14:01, 14:07, 14:57, 15:46 UTC all landed during
+downtime gaps), and the strict `max_signal_age_minutes=5` guard then rejected every one of
+them as stale on restart — permanently, since ORB emits one breakout per symbol per day.
+The bot itself was working as designed; the problem was availability plus an
+all-or-nothing staleness rule. User chose to soften the staleness rule ("option 2") rather
+than (yet) fix host uptime. Full suite green (**413 passed, 2 deselected**). Risk-officer
+**APPROVE-WITH-CONDITIONS** — all three conditions resolved (see below). Changes are
+**uncommitted** on `feature/overnight-holding`, stacked on the still-uncommitted 2026-06-02
+overnight-default work.
+
+### What shipped: stale-entry recovery (opt-in, price-revalidated)
+
+An ENTRY signal older than the 5-minute freshness guard but inside a configurable window is
+no longer dropped — it is forwarded tagged `stale_entry=True` and only fires if the live
+price is still inside a band around the signal's original entry price:
+
+```
+long:  [entry - frac·|entry - stop|,  entry + frac·|take - entry|]   (shorts mirrored)
+```
+
+Drifted toward the stop → setup failing, skip. Already run toward the take → move missed,
+skip. Either rejection is one-shot within a process (timestamp goes into the dedup set
+before the price check). FLATs are untouched (they always bypassed the guard).
+
+| File | Change |
+|---|---|
+| `src/trading_bot/strategy/{base,composite}.py` | SignalsFrame schema gains `entry_price` (float64; bar close at signal time, NaN on flats). |
+| `src/trading_bot/strategy/orb/strategy.py` | `_row()` takes `entry=`; all 4 entry sites pass the bar close; flat passes NaN; projection updated. |
+| `src/trading_bot/strategy/pullback/strategy.py` | Same treatment. |
+| `src/trading_bot/strategy/insider/strategy.py` | Entry rows carry `entry_price=entry_close`; flat NaN; projection updated. |
+| `src/trading_bot/execution/session.py` | `SessionConfig.stale_entry_window_minutes` (default **None** = off) + `stale_entry_price_band_frac` (default 0.25, enforced `[0, 1)` in `__post_init__`). `_new_signals()` tags in-window stale entries instead of dropping. New `_stale_entry_price_ok()`; `_handle_entry_signal()` gates tagged entries on it (fails closed on NaN entry/stop/take). |
+| `scripts/run_paper.py` | `--stale-entry-window` (default **0 = OFF**, per user sign-off on risk-officer recommendation) and `--stale-entry-band` (validated `[0, 1)` at startup, exits 2 with a clear error otherwise). Startup INFO log when enabled. |
+| `tests/test_execution/test_session.py` | 4 new tests: in-band stale entry fires; out-of-band skipped AND consumed (one-shot); beyond-window hard-rejected; config bounds rejected (band ≥1, <0, window ≤0) with boundary acceptance. |
+| `tests/test_strategy/test_composite.py` | Fixtures updated for the `entry_price` column. |
+
+### Risk-officer verdict — APPROVE-WITH-CONDITIONS (all resolved)
+
+1. **(HIGH, fixed)** `stale_entry_price_band_frac` was unbounded; at ≥1.0 the live fill can
+   sit at/beyond the original take/stop → instantly-breached bracket that
+   `risk/validation.py` does NOT catch (it checks stop/take positivity, not directionality
+   vs. the fill). Now enforced `[0, 1)` in `SessionConfig.__post_init__` + CLI validation +
+   guard test.
+2. **(HIGH, resolved by user decision)** Runner default was ON at 120 min; risk-officer
+   wanted OFF or explicit sign-off. **User chose default OFF.** Recovery is per-run opt-in:
+   `--stale-entry-window 120`.
+3. **(MEDIUM, documented)** Dedup is in-memory only → a price-rejected stale entry can be
+   re-evaluated **once per process restart** while still inside the window. Bounded, noted
+   in the config field docstring. Optional hardening (not done): persist the dedup set, or
+   make `client_order_id` restart-stable (it currently embeds `run_id`, so Alpaca-side
+   idempotency does not protect across restarts).
+
+Residual risk notes: with `protect_overnight` ON a stale entry fills GTC and can carry
+overnight — the band bound (#1) is what keeps its bracket sane. Sizing/kill-switch/picker/
+paper-gate all unchanged; stale entries flow through `_select_entries`, `size_position`,
+`validate_order` like any other.
+
+### Recommended launch command (tomorrow)
+
+```bash
+uv run python scripts/run_paper.py \
+    --max-capital-usd 750 \
+    --stale-entry-window 120
+```
+
+Start ~09:25 ET so the ORB window is caught live. The recovery window is the safety net for
+restarts, **not** a substitute for uptime: a breakout that runs away in price during
+downtime is unrecoverable by design. The standing offer to set up systemd + sleep
+inhibition (option 1 from the diagnosis) is still open and is the real fix.
+
+### Verification
+
+- Full suite: **413 passed, 2 deselected, 1 warning**. Invoke as
+  `uv run --no-sync pytest -q` (pytest was missing from the venv; installed via
+  `uv pip install pytest pytest-cov` — `uv sync --dev` did not bring it in).
+- `run_paper.py --help` shows both new flags; band validation exits with code 2 on bad input.
+- Audit-log vocabulary for tomorrow: `stale signal within recovery window; will revalidate
+  price` → then either `stale entry revalidated: price still near signal entry` or
+  `skipping stale entry: price outside revalidation band`.
+
+### Suggested first move next session
+
+> Commit + push the combined working tree (overnight-holding default from 2026-06-02 +
+> stale-entry recovery from 2026-06-03) on `feature/overnight-holding`, PR against `main`
+> (HTTPS remote `https://github.com/MrSvarer69/StockBot.git`) — git ops need per-action user
+> sign-off per rule #5. Then review the first session log that used
+> `--stale-entry-window 120` and check whether any stale entries fired/skipped sensibly.
+
+---
+
 ## Where we left off (2026-06-02 — overnight holding is now the paper-bot DEFAULT; risk-approved, uncommitted)
 
 User confirmed they tested the overnight stock hold on Alpaca paper and it worked, then asked to make overnight holding the default for ORB and the regular intraday bot. Implemented across 5 files, full suite green (**409 passed, 2 deselected**), risk-officer **APPROVED** (APPROVE-WITH-NITS). Changes are **uncommitted** in the working tree on branch `feature/overnight-holding` (base `d857230`). No git ops performed — awaiting per-action sign-off per rule #5.
