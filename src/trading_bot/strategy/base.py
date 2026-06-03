@@ -24,6 +24,11 @@ def empty_signals_frame() -> pd.DataFrame:
     ``strategy`` labels each row with the producer ("orb", "pullback",
     "insider") so downstream attribution can split P&L by source. The
     column appears on entry rows AND flat rows.
+
+    ``entry_price`` is the bar close at signal time — the price the strategy
+    believed it was entering at. The session's stale-entry revalidation
+    compares the live price against it before acting on an aged signal.
+    NaN on flat rows.
     """
     return pd.DataFrame(
         {
@@ -34,6 +39,7 @@ def empty_signals_frame() -> pd.DataFrame:
             "target_size_pct": pd.Series(dtype="float64"),
             "stop_price": pd.Series(dtype="float64"),
             "take_price": pd.Series(dtype="float64"),
+            "entry_price": pd.Series(dtype="float64"),
             "score": pd.Series(dtype="float64"),
             "or_atr_ratio": pd.Series(dtype="float64"),
         }

@@ -233,7 +233,7 @@ class ORBStrategy:
                             rows.append(
                                 self._row(
                                     ts, symbol, "long", stop=stop, take=take,
-                                    or_atr_ratio=proxy_score,
+                                    entry=close, or_atr_ratio=proxy_score,
                                 )
                             )
                             long_done = True
@@ -247,7 +247,7 @@ class ORBStrategy:
                             rows.append(
                                 self._row(
                                     ts, symbol, "short", stop=stop, take=take,
-                                    or_atr_ratio=proxy_score,
+                                    entry=close, or_atr_ratio=proxy_score,
                                 )
                             )
                             short_done = True
@@ -328,7 +328,7 @@ class ORBStrategy:
                     rows.append(
                         self._row(
                             ts, symbol, "long", stop=stop, take=take,
-                            or_atr_ratio=ratio,
+                            entry=close, or_atr_ratio=ratio,
                         )
                     )
                     long_done = True
@@ -338,7 +338,7 @@ class ORBStrategy:
                     rows.append(
                         self._row(
                             ts, symbol, "short", stop=stop, take=take,
-                            or_atr_ratio=ratio,
+                            entry=close, or_atr_ratio=ratio,
                         )
                     )
                     short_done = True
@@ -360,6 +360,7 @@ class ORBStrategy:
                 "target_size_pct",
                 "stop_price",
                 "take_price",
+                "entry_price",
                 "score",
                 "or_atr_ratio",
             ]
@@ -387,6 +388,7 @@ class ORBStrategy:
                 "flat",
                 stop=float("nan"),
                 take=float("nan"),
+                entry=float("nan"),
                 or_atr_ratio=float("nan"),
             )
         ]
@@ -399,6 +401,7 @@ class ORBStrategy:
         *,
         stop: float,
         take: float,
+        entry: float,
         or_atr_ratio: float,
     ) -> dict:
         return {
@@ -409,6 +412,9 @@ class ORBStrategy:
             "target_size_pct": float(self.config.target_size_pct),
             "stop_price": stop,
             "take_price": take,
+            # Bar close at signal time; the session's stale-entry
+            # revalidation compares the live price against this.
+            "entry_price": entry,
             # Unified cross-strategy conviction column. ORB's score is the
             # OR/session-ATR ratio; both columns carry the same value until
             # ``or_atr_ratio`` is retired from the picker.

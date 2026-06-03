@@ -1,3 +1,7 @@
+  uv run python scripts/run_paper.py \
+      --max-capital-usd 750 \
+      --stale-entry-window 120
+
 # Trading Bot
 
 Paper-trading sandbox. See `CLAUDE.md` for ground rules and `scripts/run_paper.py --help`
@@ -24,13 +28,31 @@ Paper-trade a custom symbol list (the default is a 56-name universe):
 uv run python scripts/run_paper.py --symbols NVDA,QQQ,AMD,MU,COIN,ORCL,SMCI
 ```
 
-## Overnight holding (experimental, opt-in)
+## Overnight holding (default on)
 
-By default every strategy flattens before the close. Overnight holding lets a
-position be carried past the close, protected by a broker-side GTC stop/take
-bracket. It is gated behind `--protect-overnight` and ships **disabled** — the
-commands below verify it works on your Alpaca paper account before you turn it
-on. All of them need `ALPACA_API_KEY`/`ALPACA_API_SECRET` in `.env` and
+The paper bot **holds positions overnight by default**. Entries are submitted
+GTC so the broker-side stop/take bracket survives the close, the intraday 15:55
+ET flat is dropped for `orb`/`pullback`, open positions are recorded to
+`data/ops/carried/` on a clean exit, and matching positions are adopted on the
+next start instead of being refused. `insider` already carries to its holding
+horizon; the only change there is that its bracket is now GTC (protected past
+the close) rather than a DAY bracket that expired at 16:00 ET.
+
+To restore the old flatten-before-close behavior (DAY brackets, 15:55 ET flat,
+no carry), pass `--no-protect-overnight`:
+
+```bash
+uv run python scripts/run_paper.py --no-protect-overnight
+```
+
+Note: `config.yaml`'s `flat_by_et: "15:55"` is unchanged — it is the
+flatten-EOD value used by **backtests** and by `--no-protect-overnight`. The
+live runner overrides it to `null` when overnight holding is on; backtests stay
+intraday.
+
+The commands below were used to verify GTC brackets work on Alpaca paper before
+this became the default. They remain useful for re-checking on a new account.
+All of them need `ALPACA_API_KEY`/`ALPACA_API_SECRET` in `.env` and
 `TRADING_MODE=paper` (the default).
 
 **Check 1 — does Alpaca accept a GTC market bracket? (run during market hours)**
@@ -67,17 +89,16 @@ for a `--keep` run.
 **Check 4 — full round-trip with the real bot**
 
 ```bash
-uv run python scripts/run_paper.py --protect-overnight
+uv run python scripts/run_paper.py
 ```
 
-Runs a paper session with overnight holding on: entries are submitted GTC, open
-positions are recorded to `data/ops/carried/` on a clean exit, and matching
-positions are adopted on the next start instead of being refused. To actually
-carry a position overnight, also set `flat_by_et: null` in that strategy's
-`config.yaml` (e.g. `src/trading_bot/strategy/orb/config.yaml`) so it stops
-emitting the 15:55 flat. Stop the bot cleanly (Ctrl-C) with a position open,
-confirm a `CARRIED_*.json` file appears, then relaunch with the same flag and
-confirm the log shows `adopting carried overnight positions`.
+Runs a normal paper session (overnight holding on by default): entries are
+submitted GTC, the intraday flat is dropped for `orb`/`pullback`, open positions
+are recorded to `data/ops/carried/` on a clean exit, and matching positions are
+adopted on the next start instead of being refused. Stop the bot cleanly
+(Ctrl-C) with a position open, confirm a `CARRIED_*.json` file appears, then
+relaunch and confirm the log shows `adopting carried overnight positions`.
 
-> Keep `--protect-overnight` and `flat_by_et: null` off until check 1 passes on
-> live paper — until then a held position would be unprotected after the close.
+> If GTC brackets are ever rejected on a new account (check 1 fails), run with
+> `--no-protect-overnight` until the broker side is sorted — otherwise a held
+> position would be unprotected after the close.

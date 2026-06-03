@@ -376,6 +376,9 @@ class InsiderStrategy:
                         "target_size_pct": float(cfg.target_size_pct),
                         "stop_price": stop,
                         "take_price": take,
+                        # Bar close at signal time; the session's stale-entry
+                        # revalidation compares the live price against this.
+                        "entry_price": entry_close,
                         # Strength in [0, 1] from the underlying detector.
                         "score": float(sig["strength"]),
                         "or_atr_ratio": float(sig["strength"]),
@@ -404,6 +407,7 @@ class InsiderStrategy:
                             "target_size_pct": float(cfg.target_size_pct),
                             "stop_price": float("nan"),
                             "take_price": float("nan"),
+                            "entry_price": float("nan"),
                             "score": float("nan"),
                             "or_atr_ratio": float("nan"),
                         }
@@ -422,6 +426,7 @@ class InsiderStrategy:
                 "target_size_pct",
                 "stop_price",
                 "take_price",
+                "entry_price",
                 "score",
                 "or_atr_ratio",
             ]

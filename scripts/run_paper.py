@@ -16,6 +16,7 @@ import argparse
 import logging
 import os
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -222,14 +223,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--protect-overnight",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "EXPERIMENTAL — hold positions overnight. Submits entries GTC so "
-            "the broker stop/take bracket survives the close, records open "
-            "positions on a clean exit, and adopts matching positions on the "
-            "next start. Requires confirming GTC-bracket acceptance on Alpaca "
-            "paper first (see scripts/probe_overnight_protection.py). Pair with "
-            "a strategy whose flat_by_et is null to actually carry overnight."
+            "Hold positions overnight (DEFAULT ON). Submits entries GTC so the "
+            "broker stop/take bracket survives the close, records open positions "
+            "on a clean exit, adopts matching positions on the next start, and "
+            "drops the intraday EOD flat (orb/pullback) so positions actually "
+            "carry. Insider already carries to its holding horizon. Pass "
+            "--no-protect-overnight to restore the old flatten-before-close "
+            "behavior (DAY brackets, 15:55 ET flat). GTC-bracket acceptance was "
+            "verified on Alpaca paper (see scripts/probe_overnight_protection.py)."
+        ),
+    )
+    p.add_argument(
+        "--stale-entry-window",
+        type=int,
+        default=0,
+        help=(
+            "Minutes after the 5-minute freshness guard during which an "
+            "entry signal may still fire if the live price has not drifted "
+            "more than --stale-entry-band of its stop/take distance from "
+            "the original signal price. DEFAULT 0 (disabled — strict "
+            "5-minute guard, per risk-officer review 2026-06-03). Pass e.g. "
+            "--stale-entry-window 120 after host downtime to recover "
+            "breakouts missed while the bot was down without chasing moves "
+            "that already ran."
+        ),
+    )
+    p.add_argument(
+        "--stale-entry-band",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of the entry->stop / entry->take distance the live "
+            "price may have moved for a stale entry to still fire "
+            "(default 0.25)."
         ),
     )
     return p.parse_args(argv)
@@ -279,7 +308,13 @@ def main(argv: list[str] | None = None) -> int:
     # which is what the session uses to look up trail enablement at entry.
     trailing_stop_policy: dict[str, bool] = {}
     if not args.no_orb:
-        orb_strategy = ORBStrategy(load_config())
+        orb_cfg = load_config()
+        # Overnight holding (the default) carries the position past the close
+        # under its GTC bracket, so the intraday 15:55 flat must not fire.
+        # --no-protect-overnight leaves the config flat (15:55) in place.
+        if args.protect_overnight:
+            orb_cfg = replace(orb_cfg, flat_by_et=None)
+        orb_strategy = ORBStrategy(orb_cfg)
         trailing_stop_policy["orb"] = orb_strategy.config.enable_trailing_stop
         inner_strategies.append(orb_strategy)
         inner_names.append("orb")
@@ -288,6 +323,10 @@ def main(argv: list[str] | None = None) -> int:
         # pullback can fire from 09:30 ET instead of waiting ~200 minutes
         # mid-session. Gated by PullbackConfig.warmup_from_prior_session.
         pullback_cfg = load_pullback_config()
+        # Same overnight coupling as ORB: with holding on (the default), drop
+        # the intraday EOD flat so the position carries under its GTC bracket.
+        if args.protect_overnight:
+            pullback_cfg = replace(pullback_cfg, flat_by_et=None)
         pullback_strategy = PullbackStrategy(pullback_cfg)
         if pullback_cfg.warmup_from_prior_session:
             today_utc = datetime.now(UTC)
@@ -327,6 +366,10 @@ def main(argv: list[str] | None = None) -> int:
                     "insider pre-flight refresh failed; continuing with "
                     "existing cache. Today's insider signals may be stale."
                 )
+        # No flat_by_et override here on purpose: insider exits via holding_days,
+        # not an intraday EOD flat, so it already carries across sessions. The
+        # protect_overnight coupling above is intentionally orb/pullback-only;
+        # the flag flip only changes insider's bracket from DAY to GTC.
         insider_strategy = InsiderStrategy(load_insider_config())
         trailing_stop_policy["insider"] = insider_strategy.config.enable_trailing_stop
         inner_strategies.append(insider_strategy)
@@ -375,6 +418,35 @@ def main(argv: list[str] | None = None) -> int:
     picker_min_ratio = (
         args.picker_min_ratio if args.picker_min_ratio > 0 else None
     )
+    if args.protect_overnight:
+        logging.getLogger(__name__).info(
+            "overnight holding ON (default): entries submitted GTC, intraday "
+            "EOD flat dropped for orb/pullback, open positions carried across "
+            "the close. Use --no-protect-overnight to flatten before the close."
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "overnight holding OFF (--no-protect-overnight): DAY brackets, "
+            "positions flattened before the close."
+        )
+    if not 0 <= args.stale_entry_band < 1:
+        # SessionConfig enforces the same bound; failing here gives the
+        # operator an argparse-style message instead of a traceback.
+        logging.getLogger(__name__).error(
+            "--stale-entry-band must be in [0, 1), got %s", args.stale_entry_band
+        )
+        return 2
+    stale_entry_window = (
+        args.stale_entry_window if args.stale_entry_window > 0 else None
+    )
+    if stale_entry_window is not None:
+        logging.getLogger(__name__).info(
+            "stale-entry recovery ON: entries up to %d min old fire if price "
+            "is within %.2f of stop/take distance from the signal price. "
+            "Use --stale-entry-window 0 for the strict 5-minute guard.",
+            stale_entry_window,
+            args.stale_entry_band,
+        )
     config = SessionConfig(
         symbols=symbols,
         poll_interval_seconds=args.poll,
@@ -385,6 +457,8 @@ def main(argv: list[str] | None = None) -> int:
         protect_overnight=args.protect_overnight,
         max_concurrent_entries=args.max_concurrent_entries,
         picker_min_ratio=picker_min_ratio,
+        stale_entry_window_minutes=stale_entry_window,
+        stale_entry_price_band_frac=args.stale_entry_band,
         run_id=run_id,
         refresh_interval_minutes=refresh_interval_minutes,
         refresh_hook=refresh_hook,

@@ -137,6 +137,7 @@ class CompositeStrategy:
                 "target_size_pct",
                 "stop_price",
                 "take_price",
+                "entry_price",
                 "score",
                 "or_atr_ratio",
             ]

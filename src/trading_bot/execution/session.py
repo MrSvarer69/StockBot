@@ -126,7 +126,10 @@ class SessionConfig:
     # If True, a prior run's unreconciled-positions sentinel does NOT block
     # startup. Operator opt-in only; the default refusal is the safe choice.
     force_ignore_unreconciled: bool = False
-    # Overnight-holding feature gate (default OFF = current behavior). When True:
+    # Overnight-holding feature gate. The dataclass default stays OFF so any
+    # programmatic/backtest caller is flatten-safe by default; the paper runner
+    # (scripts/run_paper.py) opts IN by default and exposes --no-protect-overnight
+    # to turn it back off. When True:
     #   1. entries are submitted GTC so the broker-side stop/take bracket
     #      survives the close and protects a carried position;
     #   2. on a clean exit that leaves positions open, a CARRIED_<run_id>.json
@@ -145,6 +148,30 @@ class SessionConfig:
     # the book on hours-old opening-range breakouts (observed 2026-05-14).
     # Set to None to disable (used by tests that replay historical bars).
     max_signal_age_minutes: int | None = 5
+    # Stale-entry recovery (opt-in; default OFF so programmatic callers keep
+    # the strict 5-minute guard). When set, an ENTRY signal older than
+    # max_signal_age_minutes but younger than this window is not dropped —
+    # it is forwarded with a stale marker and revalidated against the live
+    # price at order time: it fires only if price is still inside
+    #   [entry - frac*|entry - stop|, entry + frac*|take - entry|]
+    # (mirrored for shorts), i.e. the setup has neither failed toward the
+    # stop nor already run toward the take. One-shot within a process: a
+    # price-rejected stale entry is consumed, not retried, to avoid
+    # oscillation re-entry loops — but the dedup set is IN-MEMORY ONLY, so a
+    # process restart re-evaluates the signal and can retry it once per
+    # restart while it remains inside the window (risk-officer review
+    # 2026-06-03, finding 3). Motivated 2026-06-03: host downtime at the
+    # open meant every ORB breakout was >5 min old by the time the session
+    # was up, so the bot never traded. FLAT signals are unaffected (they
+    # already bypass the staleness guard).
+    stale_entry_window_minutes: int | None = None
+    # Fraction of the stop/take distance the live price may have drifted
+    # from the signal's entry_price for a stale entry to still fire. Must be
+    # in [0, 1): at >= 1.0 the live fill could sit at/beyond the original
+    # take (long) or stop, producing an instantly-breached bracket that
+    # risk validation does not catch (it checks positivity, not
+    # directionality). Enforced in __post_init__.
+    stale_entry_price_band_frac: float = 0.25
     # Halt after this many consecutive transient BrokerError absorbed inside
     # the mid-sleep daily-loss check. Catches a flapping connection that
     # recovers each top-of-loop and would otherwise mask the cap indefinitely.
@@ -201,6 +228,23 @@ class SessionConfig:
             raise ValueError(
                 "SessionConfig.refresh_interval_minutes must be a positive "
                 f"int or None (got {self.refresh_interval_minutes})"
+            )
+        if (
+            self.stale_entry_window_minutes is not None
+            and self.stale_entry_window_minutes <= 0
+        ):
+            raise ValueError(
+                "SessionConfig.stale_entry_window_minutes must be a positive "
+                f"int or None (got {self.stale_entry_window_minutes})"
+            )
+        # frac >= 1.0 would let the live fill sit at/beyond the original
+        # take (long) or stop, i.e. an instantly-breached bracket. Risk
+        # validation checks stop/take positivity, not directionality vs. the
+        # fill, so this is the only guard.
+        if not 0 <= self.stale_entry_price_band_frac < 1:
+            raise ValueError(
+                "SessionConfig.stale_entry_price_band_frac must be in "
+                f"[0, 1) (got {self.stale_entry_price_band_frac})"
             )
 
 
@@ -987,6 +1031,41 @@ def _build_order(
     )
 
 
+def _stale_entry_price_ok(
+    sig: dict,
+    current_price: Decimal,
+    band_frac: float,
+) -> bool:
+    """Price revalidation for a stale-marked entry signal.
+
+    Accept only if the live price is still inside a band around the signal's
+    original ``entry_price``: at most ``band_frac`` of the entry→stop
+    distance in the adverse direction (a deeper move means the setup is
+    failing) and at most ``band_frac`` of the entry→take distance in the
+    favorable direction (further means the move has already run without us).
+    Missing/NaN ``entry_price``, ``stop_price`` or ``take_price`` fails
+    closed — the stale entry is rejected.
+    """
+    entry_raw = sig.get("entry_price")
+    if entry_raw is None or pd.isna(entry_raw):
+        return False
+    if pd.isna(sig.get("stop_price")) or pd.isna(sig.get("take_price")):
+        return False
+    entry = Decimal(str(entry_raw))
+    stop = Decimal(str(sig["stop_price"]))
+    take = Decimal(str(sig["take_price"]))
+    frac = Decimal(str(band_frac))
+    stop_dist = abs(entry - stop)
+    take_dist = abs(take - entry)
+    if str(sig["side"]) == "long":
+        lo = entry - frac * stop_dist
+        hi = entry + frac * take_dist
+    else:
+        lo = entry - frac * take_dist
+        hi = entry + frac * stop_dist
+    return lo <= current_price <= hi
+
+
 def _handle_entry_signal(
     *,
     sig: dict,
@@ -995,6 +1074,7 @@ def _handle_entry_signal(
     sess: SessionState,
     sleep_fn=time.sleep,
     protect_overnight: bool = False,
+    stale_price_band_frac: float = 0.25,
 ) -> BrokerOrderResponse | None:
     symbol = str(sig["symbol"])
     side_str = str(sig["side"])
@@ -1009,6 +1089,32 @@ def _handle_entry_signal(
             extra={"symbol": symbol, "side": side_str},
         )
         return None
+
+    if sig.get("stale_entry"):
+        if not _stale_entry_price_ok(sig, current_price, stale_price_band_frac):
+            # One-shot by design: the timestamp is already in the dedup set,
+            # so a price-rejected stale entry is not retried next iteration.
+            logger.warning(
+                "skipping stale entry: price outside revalidation band",
+                extra={
+                    "symbol": symbol,
+                    "side": side_str,
+                    "signal_entry_price": str(sig.get("entry_price")),
+                    "current_price": str(current_price),
+                    "band_frac": stale_price_band_frac,
+                },
+            )
+            return None
+        logger.info(
+            "stale entry revalidated: price still near signal entry",
+            extra={
+                "symbol": symbol,
+                "side": side_str,
+                "signal_entry_price": str(sig.get("entry_price")),
+                "current_price": str(current_price),
+                "band_frac": stale_price_band_frac,
+            },
+        )
 
     stop = (
         Decimal(str(sig["stop_price"]))
@@ -1306,6 +1412,7 @@ def _new_signals(
     *,
     now_utc: datetime,
     max_age_minutes: int | None,
+    stale_window_minutes: int | None = None,
 ) -> list[dict]:
     seen = sess.processed_signal_ts.setdefault(symbol, set())
     sym_signals = signals[signals["symbol"] == symbol]
@@ -1334,6 +1441,25 @@ def _new_signals(
         sig_ts = sig_ts.tz_localize(UTC)
     age = now_utc - sig_ts.to_pydatetime()
     if age > timedelta(minutes=max_age_minutes):
+        # Stale-entry recovery: inside the (opt-in) extended window the
+        # signal is forwarded with a marker; _handle_entry_signal only acts
+        # on it if the live price is still near the original entry_price.
+        if stale_window_minutes is not None and age <= timedelta(
+            minutes=stale_window_minutes
+        ):
+            logger.info(
+                "stale signal within recovery window; will revalidate price",
+                extra={
+                    "symbol": symbol,
+                    "side": side,
+                    "signal_ts": sig_ts.isoformat(),
+                    "age_minutes": round(age.total_seconds() / 60, 1),
+                    "stale_window_minutes": stale_window_minutes,
+                },
+            )
+            out = latest.to_dict()
+            out["stale_entry"] = True
+            return [out]
         logger.warning(
             "skipping stale signal",
             extra={
@@ -1666,6 +1792,7 @@ def run_session(
                     sess,
                     now_utc=now_fn(),
                     max_age_minutes=config.max_signal_age_minutes,
+                    stale_window_minutes=config.stale_entry_window_minutes,
                 ):
                     if sig["side"] == "flat":
                         flat_signals.append((symbol, sig))
@@ -1704,6 +1831,7 @@ def run_session(
                     sess=sess,
                     sleep_fn=sleep_fn,
                     protect_overnight=config.protect_overnight,
+                    stale_price_band_frac=config.stale_entry_price_band_frac,
                 )
 
             sess.consecutive_failures = 0  # Reset on success.

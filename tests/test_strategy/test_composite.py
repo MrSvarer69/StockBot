@@ -32,6 +32,7 @@ def _entry(
         "target_size_pct": 0.10,
         "stop_price": stop,
         "take_price": take,
+        "entry_price": 100.0,
         "score": score,
         "or_atr_ratio": score,
     }
@@ -46,6 +47,7 @@ def _flat(ts: str, symbol: str, *, strategy: str = "orb") -> dict:
         "target_size_pct": 0.10,
         "stop_price": float("nan"),
         "take_price": float("nan"),
+        "entry_price": float("nan"),
         "score": float("nan"),
         "or_atr_ratio": float("nan"),
     }
@@ -64,6 +66,7 @@ def _frame(rows: list[dict]) -> pd.DataFrame:
             "target_size_pct",
             "stop_price",
             "take_price",
+            "entry_price",
             "score",
             "or_atr_ratio",
         ]

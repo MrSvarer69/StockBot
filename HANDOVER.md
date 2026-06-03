@@ -6,6 +6,68 @@
 
 ---
 
+## Where we left off (2026-06-02 — overnight holding is now the paper-bot DEFAULT; risk-approved, uncommitted)
+
+User confirmed they tested the overnight stock hold on Alpaca paper and it worked, then asked to make overnight holding the default for ORB and the regular intraday bot. Implemented across 5 files, full suite green (**409 passed, 2 deselected**), risk-officer **APPROVED** (APPROVE-WITH-NITS). Changes are **uncommitted** in the working tree on branch `feature/overnight-holding` (base `d857230`). No git ops performed — awaiting per-action sign-off per rule #5.
+
+### What the feature was before
+
+Overnight holding already existed but was opt-in (default off), gated behind two independent switches: the session-wide `--protect-overnight` flag (default `False`) AND each strategy's `flat_by_et` config (default `"15:55"`, which liquidates before the close). Both had to be flipped for a position to actually carry. The broker side (GTC bracket survives the close, carried-position records, adoption on restart, HELD-stop replace) was already built and tested in the three commits leading up to `d857230`.
+
+### What changed this session
+
+| File | Change |
+|---|---|
+| `scripts/run_paper.py` | `--protect-overnight` → `argparse.BooleanOptionalAction`, `default=True`; adds `--no-protect-overnight` opt-out. When on, runner does `replace(cfg, flat_by_et=None)` for **orb + pullback** so the intraday EOD flat is dropped and positions carry under the GTC bracket. Added startup INFO log (on/off). Added comment at insider wiring noting the coupling is intentionally orb/pullback-only. New `from dataclasses import replace`. |
+| `src/trading_bot/strategy/orb/config.yaml` | **Comment only.** `flat_by_et` value deliberately left `"15:55"`. |
+| `src/trading_bot/strategy/pullback/config.yaml` | **Comment only.** `flat_by_et` value deliberately left `"15:55"`. |
+| `src/trading_bot/execution/session.py` | **Comment only** on the `protect_overnight` field doc. Dataclass default stays `False`. |
+| `README.md` | Reframed the "Overnight holding" section from "experimental, opt-in" to "default on"; documented `--no-protect-overnight`. |
+
+### The load-bearing design decision (read before editing further)
+
+`flat_by_et` lives in the **shared** `config.yaml`, which **backtests and the test suite also load**. Setting `flat_by_et: null` there would silently change backtest semantics (positions carrying across days, which the engine isn't set up to model honestly) and break several default-config tests (`test_orb.py:41,197`, `test_pullback.py:136` all assert the 15:55 flat fires by default). So instead:
+
+- `config.yaml` keeps `flat_by_et: "15:55"` → the **backtest / `--no-protect-overnight`** value. Backtests stay intraday and deterministic.
+- The **live runner** forces it to `None` via `replace(...)` only when `protect_overnight` is on (now the default). The CLI is the **only** default-on surface.
+- `SessionConfig.protect_overnight` dataclass default stays `False` → all programmatic / backtest / test callers remain flatten-safe.
+
+**Consequence to remember:** editing `flat_by_et` in `config.yaml` does NOT change the live default — only the backtest/opt-out path. The live value is forced in `run_paper.py`.
+
+### Per-strategy behavior under the new default
+
+- **orb / pullback:** EOD flat dropped, position carries under its GTC stop/take bracket.
+- **insider:** already carried across sessions via `holding_days` (no `flat_by_et`, so no override). The flag flip changes its bracket from DAY → GTC. Risk-officer flagged that insider was previously carrying **unprotected** (the DAY bracket expired at 16:00 ET while the position rolled), so this is **strictly safer, not a regression** — worth noting as a latent bug this change closes.
+
+### Risk-officer verdict — APPROVE-WITH-NITS
+
+Confirmed: no window where a position is held overnight without a GTC bracket (entry + both legs submit atomically as one GTC bracket via `OrderClass.BRACKET`, tif flows through `alpaca_paper.py:251,265`); `SessionConfig.protect_overnight` default still `False`; risk gauntlet (`validate_order`) is tif-agnostic so GTC passes the same checks; carried risk correctly stays counted against `max_position_count`/`max_capital_usd` into the next session; daily-loss baseline rebases per ET day; `TRADING_MODE` gate and risk routing untouched.
+
+Nits:
+1. *(optional, NOT done)* Surface the effective live `flat_by_et` in the startup log. Judged sufficient — the existing log line already states "intraday EOD flat dropped for orb/pullback".
+2. *(DONE)* Added the insider-wiring comment.
+
+### Caveats to carry forward
+
+- **Trailing stop is frozen overnight.** The ratchet only runs while the bot is live; the GTC bracket still enforces the last stop level, but it won't tighten until the bot is back up. Already noted in `pullback/config.yaml`.
+- **Paper-only.** Nothing here touches the live-trading gate.
+- If GTC brackets are ever rejected on a new account (probe check #1 fails), run with `--no-protect-overnight` until sorted.
+
+### Verification
+
+- Full suite: `uv run --with pytest python -m pytest -q` → **409 passed, 2 deselected, 1 warning**. (Note: `pytest` must be invoked via `uv run --with pytest python -m pytest`; bare `pytest`/`python -m pytest` fail — not on PATH / not synced into the venv.)
+- `--help` shows the `--protect-overnight | --no-protect-overnight` pair with the default-on help text.
+
+### Suggested first move next session
+
+> "Commit the 5-file working-tree change on `feature/overnight-holding` (needs user sign-off), then push and open a PR against `main` (HTTPS remote `https://github.com/MrSvarer69/StockBot.git`). Optional follow-ups: risk-officer nit #1 (log effective `flat_by_et`), and a live paper round-trip — stop with a position open, confirm a `CARRIED_*.json` lands in `data/ops/carried/`, relaunch, confirm the 'adopting carried overnight positions' log line."
+
+### Note on the older `$435 deployment` thread below
+
+Unrelated to this session and still open (see the 2026-05-23 sections). This session did not touch sizing, the universe, or the audit-log flake.
+
+---
+
 ## Where we left off (2026-05-23, late evening — cheap-universe screen falsifies the $435 deployment hypothesis; one diagnostic still owed before parking)
 
 This session attempted to answer the open `$435 deployment` problem from the previous (same-day, evening) session by hunting for a cheaper universe. Conclusion: at the existing acceptance bar, no cheap-deployable symbol clears it on either ORB or pullback at honest slippage. No code changes shipped; no tests written; the work was screening-only. The next session has a single small diagnostic to run, then a clean fork: deploy a single name or park the `$435` question entirely.

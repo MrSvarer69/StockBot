@@ -2102,6 +2102,121 @@ def test_fresh_signal_passes_staleness_guard():
     assert len(broker.submitted_orders) == 1
 
 
+def test_stale_entry_within_window_fires_when_price_in_band():
+    """Stale-entry recovery: an entry past the freshness guard but inside
+    stale_entry_window_minutes fires when the live price is still near the
+    signal's entry_price.
+
+    Synthetic up-breakout: entry close 101.5, stop 98.5, take 107.5. With
+    band_frac=0.25 the acceptance band is [100.75, 103.0]; 102 is inside.
+    """
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("102")},
+    )
+    # Breakout bar is 10:00 ET = 15:00 UTC; now is 90 min later.
+    late_now = datetime(2026, 1, 5, 16, 30, tzinfo=UTC)
+    config = SessionConfig(
+        symbols=["SPY"],
+        poll_interval_seconds=0,
+        max_iterations=1,
+        flatten_on_exit=False,
+        max_signal_age_minutes=5,
+        stale_entry_window_minutes=240,
+        stale_entry_price_band_frac=0.25,
+    )
+    run_session(
+        broker,
+        _strategy(),
+        config,
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: late_now,
+        install_signals=False,
+    )
+    buys = [o for o in broker.submitted_orders if o.side == OrderSide.BUY]
+    assert len(buys) == 1
+    assert buys[0].symbol == "SPY"
+
+
+def test_stale_entry_within_window_skipped_when_price_out_of_band():
+    """A stale entry whose live price drifted outside the revalidation band
+    must not fire — and must not be retried (one-shot consumption)."""
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        # 100 < 100.75 band floor: price fell back toward the stop.
+        latest_prices={"SPY": Decimal("100")},
+    )
+    late_now = datetime(2026, 1, 5, 16, 30, tzinfo=UTC)
+    config = SessionConfig(
+        symbols=["SPY"],
+        poll_interval_seconds=0,
+        max_iterations=2,  # second iteration proves the signal was consumed
+        flatten_on_exit=False,
+        max_signal_age_minutes=5,
+        stale_entry_window_minutes=240,
+        stale_entry_price_band_frac=0.25,
+    )
+    state = run_session(
+        broker,
+        _strategy(),
+        config,
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: late_now,
+        install_signals=False,
+    )
+    assert state.iterations == 2
+    assert broker.submitted_orders == []
+
+
+def test_stale_entry_band_frac_out_of_bounds_rejected():
+    """band_frac >= 1.0 would allow a fill at/beyond the original take/stop
+    (instantly-breached bracket); SessionConfig must refuse to construct."""
+    with pytest.raises(ValueError, match="stale_entry_price_band_frac"):
+        _config(stale_entry_price_band_frac=1.0)
+    with pytest.raises(ValueError, match="stale_entry_price_band_frac"):
+        _config(stale_entry_price_band_frac=-0.1)
+    with pytest.raises(ValueError, match="stale_entry_window_minutes"):
+        _config(stale_entry_window_minutes=0)
+    # Boundary values that must remain accepted.
+    _config(stale_entry_price_band_frac=0.0)
+    _config(stale_entry_price_band_frac=0.99)
+    _config(stale_entry_window_minutes=None)
+
+
+def test_stale_entry_beyond_window_skipped():
+    """Past stale_entry_window_minutes the original hard rejection applies,
+    regardless of price."""
+    bars = make_synthetic_session(_SESSION_DATE, breakout="up")
+    broker = FakeBroker(
+        bars_by_symbol={"SPY": bars},
+        latest_prices={"SPY": Decimal("102")},  # would pass the band check
+    )
+    late_now = datetime(2026, 1, 5, 16, 30, tzinfo=UTC)  # age ~90 min
+    config = SessionConfig(
+        symbols=["SPY"],
+        poll_interval_seconds=0,
+        max_iterations=1,
+        flatten_on_exit=False,
+        max_signal_age_minutes=5,
+        stale_entry_window_minutes=60,
+        stale_entry_price_band_frac=0.25,
+    )
+    run_session(
+        broker,
+        _strategy(),
+        config,
+        _risk(),
+        sleep_fn=lambda _s: None,
+        now_fn=lambda: late_now,
+        install_signals=False,
+    )
+    assert broker.submitted_orders == []
+
+
 def test_trade_records_real_fill_price_when_submit_returns_no_fill():
     """Regression: market orders return `accepted` with filled_avg_price=None.
 

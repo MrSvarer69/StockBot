@@ -263,6 +263,7 @@ class PullbackStrategy:
                 "target_size_pct",
                 "stop_price",
                 "take_price",
+                "entry_price",
                 "score",
                 "or_atr_ratio",
             ]
@@ -343,7 +344,8 @@ class PullbackStrategy:
                     rows.append(
                         self._row(
                             idx[i], symbol, "long",
-                            stop=stop, take=take, score=score,
+                            stop=stop, take=take, entry=float(close),
+                            score=score,
                         )
                     )
                     last_entry_idx = i
@@ -379,7 +381,8 @@ class PullbackStrategy:
                         rows.append(
                             self._row(
                                 idx[i], symbol, "short",
-                                stop=stop, take=take, score=score,
+                                stop=stop, take=take, entry=float(close),
+                                score=score,
                             )
                         )
                         last_entry_idx = i
@@ -412,7 +415,7 @@ class PullbackStrategy:
                     self._row(
                         idx[first_flat], symbol, "flat",
                         stop=float("nan"), take=float("nan"),
-                        score=float("nan"),
+                        entry=float("nan"), score=float("nan"),
                     )
                 )
         return rows
@@ -521,6 +524,7 @@ class PullbackStrategy:
         *,
         stop: float,
         take: float,
+        entry: float,
         score: float,
     ) -> dict:
         return {
@@ -531,6 +535,9 @@ class PullbackStrategy:
             "target_size_pct": float(self.config.target_size_pct),
             "stop_price": stop,
             "take_price": take,
+            # Bar close at signal time; the session's stale-entry
+            # revalidation compares the live price against this.
+            "entry_price": entry,
             "score": score,
             # Mirror into ``or_atr_ratio`` until the legacy picker migrates.
             "or_atr_ratio": score,
